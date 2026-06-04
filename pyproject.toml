@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ouroboros"
+version = "0.1.0"
+description = "A recurrent-depth (looped) transformer implemented from scratch in PyTorch — Prelude/Recurrent/Coda with fine-grained MoE, switchable MLA/GQA attention, and LTI-constrained stable looping."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Asher Khan" }]
+keywords = [
+    "transformer",
+    "recurrent-depth",
+    "looped-transformer",
+    "mixture-of-experts",
+    "mla",
+    "gqa",
+    "pytorch",
+]
+classifiers = [
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Development Status :: 3 - Alpha",
+]
+
+dependencies = [
+    "torch>=2.1",
+    "numpy",
+    "datasets",
+    "transformers",
+    "tokenizers",
+    "wandb",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+# Development / testing.
+dev = ["pytest", "ruff", "black"]
+# Optional inference fast paths — install manually (not required on T4).
+# flash-attn targets Ampere (sm80)+; bitsandbytes provides INT8 linear layers.
+fast = ["flash-attn", "bitsandbytes"]
+
+[tool.setuptools.packages.find]
+include = ["ouroboros*"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

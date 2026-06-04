@@ -1,0 +1,26 @@
+# Ouroboros runtime + development dependencies.
+# Target hardware: single Google Colab T4 (16 GB, Turing sm75, FP16).
+# Pins are intentionally loose / lower-bounded to stay Colab-compatible.
+
+# --- Core ---
+torch>=2.1            # SDPA flash/mem-efficient backend lives here; T4-compatible
+numpy                 # array/host-side ops, RoPE precompute helpers
+
+# --- Data + tokenization ---
+datasets              # WikiText-103 / FineWeb-Edu slices for training
+transformers          # tokenizer + dataset utilities (model code is from scratch)
+tokenizers            # fast BPE tokenizer training (small vocab_size=8192)
+
+# --- Training / experiment tracking ---
+wandb                 # log loss, ρ(A) spectral radius, grad norm, tokens/s
+tqdm                  # progress bars for training/benchmark loops
+
+# --- Testing ---
+pytest                # unit + integration test suite
+
+# --- Optional fast paths (install manually; NOT required on T4) ---
+# flash-attn          # FlashAttention-2 native kernel — Ampere (sm80)+ only;
+#                     # forward-only and often fails to build on Turing (T4).
+#                     # On T4 the SDPA flash backend is the realistic path.
+# bitsandbytes        # INT8 linear layers for quantized inference (Phase 7);
+#                     # alternative to torch.ao.quantization.
