@@ -10,10 +10,9 @@ parameters, and supports **depth extrapolation** — running more loops at infer
 than were used during training.
 
 The architecture is grounded in the recurrent-depth / looped-transformer
-literature: Universal Transformers and Adaptive Computation Time for the looped
-core and halting, Parcae for the LTI stability constraint, DeepSeek-V2 (MLA) and
-DeepSeekMoE / DeepSeek-V3 for attention and mixture-of-experts, and Relaxed
-Recursive Transformers for depth-wise LoRA. See
+literature: Universal Transformers for the looped core, Parcae for the LTI
+stability constraint, and DeepSeek-V2 (MLA) and DeepSeekMoE / DeepSeek-V3 for
+attention and mixture-of-experts. See
 [`docs/READING_LIST.md`](docs/READING_LIST.md) for the full bibliography.
 
 ---
@@ -32,14 +31,12 @@ Recursive Transformers for depth-wise LoRA. See
 - **Fine-grained Mixture-of-Experts** in the recurrent block — routed plus
   always-on shared experts, with aux-loss-free load balancing via a router-bias
   update (DeepSeek-V3).
-- **Adaptive Computation Time** — a per-position halting head gives variable compute
-  within a single batch: easy positions halt early, hard ones loop deeper.
-- **Depth-wise LoRA** — small per-loop low-rank adapters let the shared weights
-  behave differently at each depth, with index clamping for inference-time depth
-  extrapolation.
+- **Depth extrapolation** — a fixed loop count at training time, with a sinusoidal
+  loop-index signal that lets the shared weights run deeper at inference than they
+  were trained on.
 - **Optimized inference** — FlashAttention-2 with a `scaled_dot_product_attention`
   fallback, INT8 post-training quantization, and continuous depth-wise batching
-  (sequences exit the loop at different depths within one batch).
+  (sequences exit the loop at different convergence-driven depths within one batch).
 - **Compact and single-GPU friendly** — defaults target a small model trainable on a
   single consumer / Colab-class GPU (e.g. a 16 GB T4).
 
@@ -63,12 +60,9 @@ Recursive Transformers for depth-wise LoRA. See
  │    h_loop   = loop_index_embedding(h, t, loop_dim)   # sinusoid  │
  │    combined = RMSNorm(h_loop + e)                                │
  │    trans    = TransformerBlock(combined, ...)  # MLA/GQA + MoE   │
- │    trans    = trans + LoRAAdapter(trans, t)    # depth-wise LoRA │
  │    h        = LTIInjection(h, e, trans)  # h = A·h + B·e + trans │
- │    p        = ACTHalting(h)              # per-position halt prob │
- │    accumulate ACT-weighted h into h_out; halt converged positions│
  └──────────────────────────────────────────────────────────────────┘
-      │  x := h_out (B, T, dim)
+      │  x := h (B, T, dim) — final hidden state after n_loops
       ▼
  [Coda]  coda_layers × TransformerBlock (dense SwiGLU FFN), run ONCE
       │  x (B, T, dim)
@@ -161,7 +155,7 @@ Training and inference benchmarking entry points live in
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | The build phases — goals, components, and acceptance criteria. |
 | [`docs/DESIGN_DECISIONS.md`](docs/DESIGN_DECISIONS.md) | Major design choices: alternatives, rationale, and tradeoffs. |
 | [`docs/READING_LIST.md`](docs/READING_LIST.md) | The papers behind each component, organized by what to focus on. |
-| [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md) | Experiment plans and result templates (LTI stability, ACT, MLA vs GQA, MoE, INT8, depth-wise batching, loop sweep). |
+| [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md) | Experiment plans and result templates (LTI stability, MLA vs GQA, MoE, INT8, depth-wise batching, loop sweep). |
 
 ---
 

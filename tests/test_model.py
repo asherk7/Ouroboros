@@ -54,8 +54,7 @@ def tiny_config(attn_type: str = "gqa", **overrides: object) -> OuroborosConfig:
     * Small MoE: ``n_experts=4``, ``n_shared_experts=1``,
       ``n_experts_per_tok=2``, ``expert_dim=32``.
     * Shallow stacks: ``prelude_layers=1``, ``coda_layers=1``,
-      ``max_loop_iters=4``, ``max_seq_len=64``, ``vocab_size=256``,
-      ``lora_rank=4``.
+      ``max_loop_iters=4``, ``max_seq_len=64``, ``vocab_size=256``.
 
     Args:
         attn_type: Attention backend to configure (``"gqa"`` or ``"mla"``).
@@ -175,9 +174,9 @@ def test_depth_extrapolation_changes_output(attn_type: str) -> None:
     """Running more loops than trained changes the forward output.
 
     Calling ``forward`` with ``n_loops`` greater than ``cfg.max_loop_iters`` must
-    run without error (the LoRA scale index clamps) and produce logits different
-    from a shallower ``n_loops`` — confirming test-time depth extrapolation is
-    wired through for both backends.
+    run without error (the loop-index embedding is well-defined for any depth) and
+    produce logits different from a shallower ``n_loops`` — confirming test-time
+    depth extrapolation is wired through for both backends.
     """
     pytest.skip("stub — implement in Phase 5")
 
@@ -239,6 +238,6 @@ def test_generate_depthwise_batched_output_shape(attn_type: str) -> None:
     For both backends, generating with continuous depth-wise batching on a
     ``(B, T)`` prompt must return token ids of shape ``(B, T + max_new_tokens)``
     — matching the standard ``generate`` contract while sequences exit the loop
-    at different ACT-driven depths within the batch.
+    at different convergence-driven depths within the batch.
     """
     pytest.skip("stub — implement in Phase 7")

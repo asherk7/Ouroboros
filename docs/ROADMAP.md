@@ -8,13 +8,13 @@
 ## What Ouroboros is
 
 Ouroboros is an honest, from-scratch implementation inspired by the recurrent-depth
-transformer literature (Universal Transformers, Parcae, DeepSeek-V2/V3, DeepSeekMoE,
-Relaxed Recursive Transformers). It is a **Prelude / Recurrent / Coda** design: a few
+transformer literature (Universal Transformers, Parcae, DeepSeek-V2/V3, DeepSeekMoE).
+It is a **Prelude / Recurrent / Coda** design: a few
 dense blocks encode the input once (Prelude), a single weight-tied block is looped `T`
 times with stable input injection (Recurrent Block), and a few dense blocks decode the
 result once (Coda). The loop carries fine-grained MoE (routed + shared experts),
-switchable MLA/GQA attention, depth-wise LoRA, sinusoidal loop-index embedding,
-LTI-constrained injection for stability, and ACT halting for adaptive per-token depth.
+switchable MLA/GQA attention, a sinusoidal loop-index embedding, and
+LTI-constrained injection for stability (a fixed loop count — no adaptive halting).
 Beyond the literature, Ouroboros adds **INT8 quantized inference** and **continuous
 depth-wise batching** as the inference differentiators.
 
@@ -51,9 +51,9 @@ manual fallback; the `flash_attn_func` kernel is kept as an optional Ampere fast
         ├──────────────┬───────────────┐                 │
         ▼              ▼               ▼                  │
  Phase 2 Attention  Phase 3 MoE   Phase 4 Recurrence ◄────┘  (P4 needs P1–P3)
- (GQA, MLA)         (Expert,      (LTIInjection, ACTHalting,
-        │            MoEFFN)       LoRAAdapter, loop_index_embedding,
-        │              │           TransformerBlock, RecurrentBlock)
+ (GQA, MLA)         (Expert,      (LTIInjection, loop_index_embedding,
+        │            MoEFFN)       TransformerBlock, RecurrentBlock)
+        │              │
         └──────┬───────┴───────────────┐
                ▼                        ▼
         Phase 5  Full model + generation (Ouroboros, KV cache, generate)
@@ -77,7 +77,7 @@ together attention (P2) and `MoEFFN` (P3).
 
 Estimates assume ~4–6 focused hours/day. The build-from-reference timeline can compress
 because the math and shapes are well understood up front; the spread reflects
-"smooth run" vs "debugging the subtle bits" (KV-cache ⊗ ACT interaction, dual RoPE
+"smooth run" vs "debugging the subtle bits" (KV-cache decode correctness, dual RoPE
 buffers, `start_pos` decode slicing, fp16 stability). **Phases 1–5 ≈ ~10 days** is the
 realistic architecture-build target.
 
@@ -233,23 +233,20 @@ split and the load-tracking + update step.
 
 ## Phase 4 — Recurrence machinery
 
-**Goal.** Build the heart of Ouroboros: stable input injection, adaptive halting,
-depth-wise adaptation, the per-depth loop-index signal, the composed transformer block,
-and the recurrent loop that ties them together. This phase delivers the stability claim
-(resume bullet 2) at the component level.
+**Goal.** Build the heart of Ouroboros: stable input injection, the per-depth
+loop-index signal, the composed transformer block, and the fixed-depth recurrent loop
+that ties them together. This phase delivers the stability claim (resume bullet 2) at
+the component level.
 
 **Components built** (exact names, in dependency order):
 - `loop_index_embedding` — `recurrence.py` (sinusoidal depth signal added to the first
   `loop_dim` channels).
-- `LoRAAdapter` — `recurrence.py` (`delta(x, t) = (down(x) * scale[t]) @ B`; per-loop
-  `scale: Embedding(max_loops, rank)`; clamp `loop_t` for depth extrapolation).
 - `LTIInjection` — `recurrence.py` (`log_A`, `log_dt`, `B`; `get_A()`; `forward` →
   `A·h + B·e + transformer_out`).
-- `ACTHalting` — `recurrence.py` (`sigmoid(Linear(dim, 1)(h)).squeeze(-1)`).
 - `TransformerBlock` — `block.py` (pre-norm; attention from `attn_type`; FFN = `MoEFFN`
   if `use_moe` else dense `Expert`; two `RMSNorm`s; residual + dropout).
-- `RecurrentBlock` — `recurrence.py` (owns `block` (use_moe=True), `injection`, `act`,
-  `lora`, `norm`, `loop_dim = loop_index_dim or dim // 8`; runs the loop per spec §3).
+- `RecurrentBlock` — `recurrence.py` (owns `block` (use_moe=True), `injection`, `norm`,
+  `loop_dim = loop_index_dim or dim // 8`; runs the fixed-depth loop per spec §3).
 
 **Acceptance criteria** (concrete):
 - **Spectral radius < 1 by construction (the headline stability check).**
@@ -258,31 +255,27 @@ and the recurrent loop that ties them together. This phase delivers the stabilit
   on `log_A`/`log_dt`. Also assert all entries of `get_A()` lie strictly in `(0, 1)` and
   that no NaN appears even when `log_dt → +∞, log_A → +∞` (the `(-20, 20)` log-space
   clamp must hold).
-- **ACT halts some positions early.** On a synthetic input, after the loop at least one
-  position reaches `cumulative_p ≥ act_threshold` before the final iteration; halting
-  depth varies across positions (not all positions halt on the same step).
 - **More loops change the output.** For the same input, `RecurrentBlock` outputs at
   `n_loops=2` vs `n_loops=8` differ measurably (relative L2 difference above a small
   threshold) — depth actually does work.
 - **Loop-index differs per iteration.** `loop_index_embedding(h, t=0, ...)` ≠
   `loop_index_embedding(h, t=3, ...)` on the first `loop_dim` channels, and the remaining
   `dim - loop_dim` channels are **unchanged** (passthrough verified exactly).
-- **LoRA depth extrapolation clamp.** `LoRAAdapter.forward(x, loop_t)` with
-  `loop_t > max_loops - 1` does not raise and reuses the last learned `scale` (assert the
-  output equals that of `loop_t = max_loops - 1`).
+- **Depth extrapolation runs.** `RecurrentBlock.forward(..., n_loops=16)` for a block
+  whose `max_loop_iters=8` runs without error and stays finite — the sinusoidal
+  loop-index is defined for any depth, so there is no learned per-loop table to index out
+  of range.
 - **TransformerBlock parity with `use_moe`.** `TransformerBlock(cfg, use_moe=False)` uses
   a dense `Expert(dim, dim*4//3)`; `use_moe=True` uses `MoEFFN`; both map
   `(B, T, dim) → (B, T, dim)` with no NaN for GQA and MLA `attn_type`.
-- **KV-cache ⊗ ACT short-circuit invariant.** With `kv_cache=None`, the loop may
-  `break` once `halted.all()`. With a non-None `kv_cache`, **every** loop depth runs on
-  every forward pass — assert that after a forward all cache keys
-  `recurrent_loop_{0..n_loops-1}` are populated even when ACT would have halted everything
-  early. (This is the single most important correctness subtlety; it is also the crux of
-  Phase 7.)
+- **Fixed-depth loop populates all cache keys.** With a non-None `kv_cache`, a forward
+  runs every loop depth and populates cache keys `recurrent_loop_{0..n_loops-1}`, so the
+  standard decode path (Phase 5) and depth-wise batching (Phase 7) inherit a fully
+  populated cache with no early-exit edge case.
 
-**Estimated effort.** ~2–3 days. `LTIInjection` and the ACT remainder/weighting bookkeeping
-are subtle; the KV-cache-vs-short-circuit rule must be implemented and tested carefully
-here so Phase 5/7 inherit a correct loop.
+**Estimated effort.** ~2–3 days. `LTIInjection`'s log-space ZOH math and the dual-RoPE /
+per-depth cache-key wiring in `RecurrentBlock` are the subtle parts; getting them right
+here means Phase 5/7 inherit a correct loop.
 
 **Dependencies.** Phase 1 (`RMSNorm`, `OuroborosConfig`), Phase 2 (attention inside
 `TransformerBlock`), Phase 3 (`MoEFFN` and `Expert` inside `TransformerBlock`).
@@ -330,8 +323,8 @@ completes resume bullet 1 — a runnable from-scratch recurrent-depth transforme
 - **Single-token (T=1) path.** A forward with `T == 1` uses `mask = None` (no causal
   mask) and runs cleanly — the decode step.
 - **Depth extrapolation changes output.** `generate(..., n_loops=16)` differs from
-  `n_loops=8` for a model whose `max_loop_iters=8` (no crash from the `LoRAAdapter`
-  clamp; output actually changes).
+  `n_loops=8` for a model whose `max_loop_iters=8` (runs deeper than training without
+  error — the sinusoidal loop-index is defined at any depth — and the output changes).
 
 **Estimated effort.** ~2 days. Most components exist by now; the work is wiring,
 weight tying, the dual-RoPE selection, and getting cached decode bit-exact against full
@@ -354,7 +347,7 @@ update into the loop.
   schedule with warmup, fp16 + `GradScaler` (T4) / bf16 fallback, gradient clipping, and
   a per-step call to `MoEFFN.update_router_bias()` across the model.
 - W&B logging of: loss, **`ρ(A) = max(model.recurrent.injection.get_A())`**, gradient
-  norm, tokens/s, learning rate, halting-depth distribution.
+  norm, tokens/s, and learning rate.
 - An ablation switch to run **LTI vs no-LTI** (the no-LTI variant replaces the stable
   update with a naive `h = transformer_out + e` style injection) for the stability
   experiment.
@@ -400,8 +393,9 @@ benchmarked against an un-optimized baseline.
 - `quantization_error(fp_model, int8_model, eval_loader)` — `quantize.py` (perplexity
   delta + related metrics).
 - `Ouroboros.generate_depthwise_batched(input_ids, max_new_tokens, max_loops,
-  temperature, top_k)` — `model.py` (the inference differentiator; solves the cache-key
-  population problem from Phase 4's KV-cache ⊗ ACT invariant).
+  convergence_tol, temperature, top_k)` — `model.py` (the inference differentiator;
+  per-sequence convergence-based early exit, solving the cache-key population problem it
+  creates).
 - `benchmarks/throughput.py` — prefill/decode latency, depth sweep, INT8 on/off, and
   depth-wise batching on/off; reports the end-to-end multiplier.
 
@@ -414,10 +408,10 @@ benchmarked against an un-optimized baseline.
   expected quantization tolerance on random inputs; norms/router/LM head remain unquantized
   (asserted).
 - **Depth-wise batching gives a measured throughput gain.** With a batch whose sequences
-  halt at different ACT depths, `generate_depthwise_batched` produces **higher tokens/s**
+  converge at different depths, `generate_depthwise_batched` produces **higher tokens/s**
   than the naive `generate` that pays max depth for every sequence — and produces
   **identical or equivalent** generations (correctness preserved). The gain is tied to the
-  measured ACT halting-depth distribution (theory predicts ~2–3×).
+  measured convergence-depth distribution (theory predicts ~2–3×).
 - **Cache-key population solved.** The chosen solution to the
   "sequence exits at depth `d` leaves `recurrent_loop_{d..n}` unpopulated" problem
   (run-to-max-active-depth-with-masking, ragged/compacted cache, or depth-bucketing) is
@@ -428,7 +422,7 @@ benchmarked against an un-optimized baseline.
   fast path. Benchmarked honestly (no claim of a native FA2 kernel on Turing).
 - **End-to-end multiplier reported.** `benchmarks/throughput.py` emits a single
   **[X]× throughput** number (optimized vs un-optimized baseline on one GPU) that fills
-  resume bullet 3 and [`EXPERIMENTS.md`](./EXPERIMENTS.md) experiments 5–6.
+  resume bullet 3 and [`EXPERIMENTS.md`](./EXPERIMENTS.md) experiments 4–5.
 
 **Estimated effort.** ~3–4 days focused engineering (plus wall-clock for benchmark
 sweeps). Depth-wise batching's cache-key bookkeeping is the hardest part of the whole
@@ -447,11 +441,11 @@ reported numbers should come from a trained model).
 benchmark table with the measured multiplier, and a green, lint-clean codebase.
 
 **Components built / finalized:**
-- `README.md` — name, one-liner, WIP status, the three resume bullets framed honestly,
+- `README.md` — reflects the current README, professional, covers the scope.
   the canonical forward-pass ASCII diagram (shared with `ARCHITECTURE.md`), and links to
   every doc in `docs/`.
-- Architecture diagram + W&B curve references (stability plot, loss curves, halting-depth
-  distribution) embedded/linked.
+- Architecture diagram + W&B curve references (stability plot, loss curves,
+  convergence-depth distribution) embedded/linked.
 - Benchmark table populated with real Phase 6–7 numbers (perplexity, KV-cache memory
   MLA vs GQA, INT8 ppl delta, depth-wise batching throughput, end-to-end **[X]×**).
 - Final pass on docstrings/type hints across all modules; `EXPERIMENTS.md`,

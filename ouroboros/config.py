@@ -10,10 +10,9 @@ use these exact names.
 
 Ouroboros is an independent, from-scratch implementation inspired by the
 recurrent-depth transformer literature (Universal Transformers, Parcae,
-DeepSeek-V2 / DeepSeekMoE / DeepSeek-V3, Relaxed Recursive Transformers). It is a
-Prelude / Recurrent / Coda design with fine-grained MoE (routed + shared experts),
-switchable MLA/GQA attention, LTI-constrained stable injection, ACT halting, and
-depth-wise LoRA.
+DeepSeek-V2 / DeepSeekMoE / DeepSeek-V3). It is a Prelude / Recurrent / Coda
+design with fine-grained MoE (routed + shared experts), switchable MLA/GQA
+attention, and LTI-constrained stable injection.
 
 Sizing notes (encode these as guidance, not as logic):
 
@@ -49,7 +48,7 @@ class OuroborosConfig:
     """Architecture and training hyperparameters for :class:`~ouroboros.model.Ouroboros`.
 
     The defaults below define a small, T4-friendly research model. Fields are
-    grouped by subsystem (core, attention, MoE FFN, recurrence/halting, load
+    grouped by subsystem (core, attention, MoE FFN, recurrence, load
     balancing, RoPE/norm/init/regularization). MLA-only fields are ignored when
     ``attn_type == "gqa"`` and vice versa.
     """
@@ -80,9 +79,7 @@ class OuroborosConfig:
     n_experts_per_tok: int = 2  # top-K routed per token
     expert_dim: int = 256  # fine-grained expert hidden width
 
-    # --- Recurrence / stability / halting ---
-    act_threshold: float = 0.99  # ACT cumulative-probability halting threshold
-    lora_rank: int = 8  # depth-wise LoRA bottleneck rank
+    # --- Recurrence ---
     # channels receiving loop-index embedding; None -> dim // 8
     loop_index_dim: Optional[int] = None
 

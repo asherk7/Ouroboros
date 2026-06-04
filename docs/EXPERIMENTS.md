@@ -1,7 +1,7 @@
 # Ouroboros — Experiment Log
 
 This is a **pre-planned experiment log**. It defines, ahead of implementation, the
-seven experiments that validate the Ouroboros architecture and back the three resume
+six experiments that validate the Ouroboros architecture and back the three resume
 claims (looped transformer from scratch, LTI-stabilized training, INT8 + depth-wise
 batched inference). Each experiment states a falsifiable hypothesis, the independent
 variable, the dependent variables, the exact `OuroborosConfig` differences, a
@@ -53,8 +53,6 @@ regime; only the deltas from the defaults are listed):
 | `n_shared_experts`       | 1      | always-active shared expert                                 |
 | `n_experts_per_tok`      | 2      | top-K routed per token                                      |
 | `expert_dim`             | 256    | fine-grained expert width                                   |
-| `act_threshold`          | 0.99   | ACT cumulative-probability halting threshold                |
-| `lora_rank`              | 8      | depth-wise LoRA bottleneck rank                             |
 | `loop_index_dim`         | `None` | → `dim // 8 = 64` channels receive the loop-index signal    |
 | `router_bias_update_rate`| 1e-3   | aux-loss-free load-balancing bias step                      |
 | `rope_theta`             | 10000  | small-model default                                         |
@@ -116,12 +114,11 @@ for fast correctness tests and is **not** used to produce any experiment numbers
 - **Project:** `ouroboros`. **Entity:** the author's default W&B entity.
 - **Run naming:** `{experiment-id}-{arm}-seed{N}` (e.g. `exp1-lti-seed0`,
   `exp1-nolti-seed0`).
-- **Tags:** the experiment id (`exp1`…`exp7`) plus the arm name, so a W&B group/filter
+- **Tags:** the experiment id (`exp1`…`exp6`) plus the arm name, so a W&B group/filter
   reconstructs each experiment.
 - **Logged every step:** training loss, **ρ(A)** (see 0.7), gradient norm (pre-clip),
   learning rate, tokens/s, and the fraction of router-bias mass moved (load-balance health).
-- **Logged every eval interval:** validation perplexity, mean ACT halting depth, and the
-  full ACT halting-depth **distribution** (see 0.8).
+- **Logged every eval interval:** validation perplexity (at `n_loops = max_loop_iters`).
 - The W&B run URL is pasted into each results table row so a number is one click from its
   curve.
 
@@ -143,14 +140,17 @@ expected to drift toward / exceed `1` as training diverges. We additionally log 
 and **min** of `get_A()` so the table can describe the whole spectrum, not just the worst
 eigenvalue.
 
-### 0.8 How the ACT halting-depth distribution is logged
+### 0.8 How the convergence-depth distribution is measured (inference)
 
-For each forward pass the recurrent block records, per position, the loop iteration `t` at
-which that position crossed `act_threshold` (i.e. its halting depth in `{1, …, n_loops}`).
-At each eval interval we aggregate halting depth over the whole validation set and log:
-the **mean** halting depth, the per-depth histogram (the **distribution** of halting depth),
-and the fraction of positions that never halt before `n_loops` (forced halts). These feed
-Experiments 2 and 6.
+The core training loop runs a **fixed** `n_loops` for every position — there is no
+adaptive halting during training. The analogous depth signal exists only at *inference*,
+inside continuous depth-wise batching (`generate_depthwise_batched`): per sequence, record
+the loop iteration `t` at which the hidden-state change falls below the threshold
+(`‖h_{t+1} − h_t‖ < convergence_tol`), i.e. its **convergence depth** in `{1, …, max_loops}`.
+We aggregate this over the eval prompts and log: the **mean** convergence depth, the
+per-depth histogram (the **distribution** of convergence depth), and the fraction of
+sequences that never converge before `max_loops`. These feed Experiment 5 (depth-wise
+batching) — the throughput win scales with the spread of this distribution.
 
 ---
 
@@ -159,12 +159,11 @@ Experiments 2 and 6.
 | #  | Name                                   | Independent variable                          | Resume bullet |
 |----|----------------------------------------|-----------------------------------------------|---------------|
 | 1  | Stability: LTI vs no-LTI               | LTI injection on/off × learning rate          | 2             |
-| 2  | ACT halting vs fixed loop count        | adaptive ACT vs fixed depth                   | 1             |
-| 3  | Attention ablation: MLA vs GQA         | `attn_type`                                   | 1             |
-| 4  | MoE vs dense (matched param budget)    | sparse MoE FFN vs dense FFN                    | 1             |
-| 5  | INT8 quantization                      | weight precision (FP16 vs INT8)               | 3             |
-| 6  | Continuous depth-wise batching         | early-exit batching on/off                    | 3             |
-| 7  | Loop-count sweep (depth extrapolation) | inference `n_loops`                            | 1             |
+| 2  | Attention ablation: MLA vs GQA         | `attn_type`                                   | 1             |
+| 3  | MoE vs dense (matched param budget)    | sparse MoE FFN vs dense FFN                    | 1             |
+| 4  | INT8 quantization                      | weight precision (FP16 vs INT8)               | 3             |
+| 5  | Continuous depth-wise batching         | convergence-based early-exit batching on/off  | 3             |
+| 6  | Loop-count sweep (depth extrapolation) | inference `n_loops`                            | 1             |
 
 ---
 
@@ -228,61 +227,7 @@ bullet 2.)_
 
 ---
 
-## Experiment 2 — ACT halting vs fixed loop count
-
-**Resume bullet:** 1 (the adaptive-depth recurrent design).
-
-### Hypothesis
-Adaptive Computation Time halting reaches validation perplexity comparable to (or better
-than) a fixed maximum loop count, while spending **fewer average loop iterations** per
-token — yielding higher decode throughput. Easy positions halt early; hard positions use
-more depth.
-
-### Independent variable
-**Halting policy:** adaptive ACT (`act_threshold = 0.99`) vs **fixed** loop count (ACT
-disabled; the model runs exactly `n_loops` iterations and returns the last hidden state).
-The fixed arm is evaluated at several fixed depths `n_loops ∈ {2, 4, 8}`.
-
-### Dependent variables
-- Validation perplexity.
-- **Mean ACT halting depth** and the full halting-depth **distribution** (§0.8) for the
-  adaptive arm.
-- Decode throughput (tokens/s) and average loop iterations executed per token.
-
-### Config differences (vs §0.2)
-- Adaptive arm: shared config, ACT active.
-- Fixed arms: same trained weights where possible, or a matched-budget run with ACT
-  accumulation replaced by "use final-iteration hidden state"; `act_threshold` is inert.
-- For a clean comparison, train one adaptive model and one fixed model with the same token
-  budget; report the adaptive model's halting distribution at eval.
-
-### Procedure (T4-realistic)
-1. Train the adaptive model under §0.2.
-2. Evaluate it; record mean halting depth + distribution + throughput.
-3. Train/evaluate the fixed-depth arms at `n_loops ∈ {2, 4, 8}`; record perplexity +
-   throughput.
-4. Compare perplexity-vs-throughput frontiers.
-
-### Results — fill in
-| Arm              | n_loops (eval) | Val PPL | Mean halt depth | Tokens/s (decode) | Avg iters/token | W&B |
-|------------------|----------------|---------|-----------------|-------------------|-----------------|-----|
-| ACT (adaptive)   | up to 8        |         |                 |                   |                 |     |
-| Fixed            | 2              |         | n/a             |                   | 2.0             |     |
-| Fixed            | 4              |         | n/a             |                   | 4.0             |     |
-| Fixed            | 8              |         | n/a             |                   | 8.0             |     |
-
-**Halting-depth distribution (adaptive arm), fraction of positions halting at each depth:**
-
-| Depth t  | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 (forced) |
-|----------|---|---|---|---|---|---|---|------------|
-| Fraction |   |   |   |   |   |   |   |            |
-
-**Verdict:** _(does adaptive halting match fixed-8 perplexity at lower average depth /
-higher throughput? state the perplexity gap and the throughput ratio.)_
-
----
-
-## Experiment 3 — Attention ablation: MLA vs GQA
+## Experiment 2 — Attention ablation: MLA vs GQA
 
 **Resume bullet:** 1 ("switchable MLA/GQA attention").
 
@@ -327,7 +272,7 @@ tradeoff.)_
 
 ---
 
-## Experiment 4 — MoE vs dense FFN (matched parameter budget)
+## Experiment 3 — MoE vs dense FFN (matched parameter budget)
 
 **Resume bullet:** 1 (fine-grained MoE with routed + shared experts).
 
@@ -376,7 +321,7 @@ activated-FLOP saving, and confirm the router did not collapse.)_
 
 ---
 
-## Experiment 5 — INT8 post-training quantization
+## Experiment 4 — INT8 post-training quantization
 
 **Resume bullet:** 3 ("INT8 quantized inference … throughput").
 
@@ -421,36 +366,38 @@ contributes to the resume-bullet-3 number.)_
 
 ---
 
-## Experiment 6 — Continuous depth-wise batching
+## Experiment 5 — Continuous depth-wise batching
 
 **Resume bullet:** 3 ("continuous depth-wise batching, achieving [X]× inference
 throughput").
 
 ### Hypothesis
-Letting sequences in a batch exit the recurrent loop at **different ACT-driven depths**
-(`generate_depthwise_batched`) — instead of every sequence paying the maximum depth
+Letting sequences in a batch exit the recurrent loop at **different convergence-driven
+depths** (`generate_depthwise_batched`, exiting a sequence once
+`‖h_{t+1} − h_t‖ < convergence_tol`) — instead of every sequence paying the maximum depth
 (`generate`) — increases batched decode throughput. The gain scales with the spread of the
-ACT halting-depth distribution: more spread → more saving. Literature suggests ~2–3×; the
-measured number fills resume bullet 3.
+convergence-depth distribution (§0.8): more spread → more saving. Literature suggests
+~2–3×; the measured number fills resume bullet 3.
 
 ### Independent variable
 Batched generation strategy: **baseline** (`generate`, every sequence runs to `n_loops`)
-vs **depth-wise batched** (`generate_depthwise_batched`, per-sequence early exit with the
-chosen cache-population solution).
+vs **depth-wise batched** (`generate_depthwise_batched`, per-sequence convergence-based
+early exit with the chosen cache-population solution).
 
 ### Dependent variables
 - Batched decode throughput (tokens/s) at several batch sizes.
-- The realized **distribution** of per-sequence exit depths in the batch.
+- The realized **distribution** of per-sequence exit depths in the batch (§0.8).
 - A correctness check: depth-wise-batched outputs match per-sequence `generate` outputs
   (the cache-key population problem is solved, not silently producing wrong tokens).
 
 ### Config differences (vs §0.2)
 - Same trained model and weights for both arms.
-- Both use a KV cache. **Critical constraint to honor (this is the headline subtlety):**
-  with a KV cache the loop must not early-exit globally — every loop depth must run on every
-  forward pass so later decode steps find populated keys at every `recurrent_loop_{t}` cache
-  key. Record which cache-population solution is used (run-to-max-active-depth + mask /
-  ragged per-sequence cache / depth bucketing).
+- Both use a KV cache. **The cache-population constraint to honor:** a sequence that
+  converges and exits at depth `d` must not leave later `recurrent_loop_{t>d}` cache keys
+  unpopulated when a future step needs them. Record which cache-population solution is used
+  (run-to-max-active-depth + mask / ragged per-sequence cache / depth bucketing).
+- Sweep `convergence_tol` over a small grid (e.g. `{1e-2, 1e-3, 1e-4}`) to trace the
+  quality/throughput tradeoff; the main table fixes the chosen value.
 - Sweep batch size `∈ {1, 4, 16, 32}` (T4-realistic; record the largest that fits in 16 GB).
 
 ### Procedure (T4-realistic)
@@ -458,8 +405,7 @@ chosen cache-population solution).
 2. Generate with `generate_depthwise_batched`; record tokens/s and the exit-depth
    distribution.
 3. Assert token-for-token equality with the baseline outputs (correctness before speed).
-4. Tie the measured throughput ratio to the ACT halting-depth distribution from
-   Experiment 2.
+4. Tie the measured throughput ratio to the convergence-depth distribution (§0.8).
 
 ### Results — fill in
 | Batch size | Baseline tok/s | Depth-wise tok/s | Throughput × | Mean exit depth | Outputs match? | W&B |
@@ -470,12 +416,12 @@ chosen cache-population solution).
 | 32         |                |                  |              |                 |                |     |
 
 **Verdict:** _(state the throughput multiplier vs baseline at the best batch size and relate
-it to the halting-depth spread. Combine with Experiment 5 for the end-to-end resume-bullet-3
-multiplier.)_
+it to the convergence-depth spread. Combine with Experiment 4 (INT8) for the end-to-end
+resume-bullet-3 multiplier.)_
 
 ---
 
-## Experiment 7 — Loop-count sweep (test-time depth extrapolation)
+## Experiment 6 — Loop-count sweep (test-time depth extrapolation)
 
 **Resume bullet:** 1 (looped/recurrent design; depth extrapolation).
 
@@ -484,12 +430,12 @@ A model trained at `max_loop_iters = 8` can be run at inference with a **differe
 `n_loops` and remain coherent — validation perplexity improves (or at least stays stable)
 as `n_loops` increases up to 8, and the model **extrapolates** beyond training depth
 (`n_loops = 16`) without collapse, thanks to the LTI injection keeping the encoded input
-alive and the LoRA scale being clamped past `max_loops - 1`.
+alive and the sinusoidal loop-index embedding being well-defined at any depth.
 
 ### Independent variable
 Inference recurrent depth `n_loops ∈ {2, 4, 8, 16}` (a forward-pass argument; **no
-retraining**). 16 exceeds the trained `max_loop_iters = 8` and exercises the depth-extrapolation
-clamp in `LoRAAdapter`.
+retraining**). 16 exceeds the trained `max_loop_iters = 8` and exercises depth
+extrapolation beyond the trained range.
 
 ### Dependent variables
 - Validation perplexity at each `n_loops`.
@@ -499,22 +445,20 @@ clamp in `LoRAAdapter`.
 ### Config differences (vs §0.2)
 - One trained model (`max_loop_iters = 8`). Only the forward/`generate` `n_loops` argument
   changes; the config dataclass is unchanged.
-- ACT halting stays active; report whether positions still halt before the (possibly larger)
-  `n_loops` cap.
 
 ### Procedure (T4-realistic)
 1. Train one model under §0.2.
 2. Evaluate validation perplexity and decode throughput at each `n_loops` value.
-3. At `n_loops = 16`, confirm the `LoRAAdapter` scale index is clamped to the last learned
-   loop (no out-of-range indexing) and outputs stay finite.
+3. At `n_loops = 16`, confirm the model runs deeper than training (the sinusoidal
+   loop-index embedding is defined for any depth) and outputs stay finite.
 
 ### Results — fill in
-| n_loops | Val PPL | Decode tok/s | Mean halt depth | Stable (no NaN)? | Notes | W&B |
-|---------|---------|--------------|-----------------|------------------|-------|-----|
-| 2       |         |              |                 |                  |       |     |
-| 4       |         |              |                 |                  |       |     |
-| 8       |         |              |                 |                  |       |     |
-| 16      |         |              |                 |                  |       |     |
+| n_loops | Val PPL | Decode tok/s | Stable (no NaN)? | Notes | W&B |
+|---------|---------|--------------|------------------|-------|-----|
+| 2       |         |              |                  |       |     |
+| 4       |         |              |                  |       |     |
+| 8       |         |              |                  |       |     |
+| 16      |         |              |                  |       |     |
 
 **Verdict:** _(does perplexity improve with depth up to 8, and does the model extrapolate to
 16 without collapse? state the perplexity at 8 vs 16.)_
@@ -525,6 +469,6 @@ clamp in `LoRAAdapter`.
 
 | Resume bullet | Backed by experiment(s) | Headline number to report                          | Status |
 |---------------|-------------------------|----------------------------------------------------|--------|
-| 1 (architecture) | 2, 3, 4, 7           | adaptive halting / MLA-GQA parity / MoE win / extrapolation |        |
+| 1 (architecture) | 2, 3, 6             | MLA-GQA parity / MoE win / depth extrapolation     |        |
 | 2 (LTI stability)| 1                   | highest LR where no-LTI diverges but LTI converges |        |
-| 3 (inference)    | 5, 6                | end-to-end throughput × (INT8 × depth-wise batching) |        |
+| 3 (inference)    | 4, 5                | end-to-end throughput × (INT8 × depth-wise batching) |        |

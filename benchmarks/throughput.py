@@ -28,7 +28,7 @@ What is measured
 * **Depth-scaling sweep** — how prefill/decode latency scales with the recurrent
   depth ``n_loops``. Because every loop iteration runs a full
   ``TransformerBlock``, latency is expected to grow roughly linearly in
-  ``n_loops``; this curve motivates ACT halting and depth-wise batching.
+  ``n_loops``; this curve motivates continuous depth-wise batching.
 * **Baseline vs INT8** — fp16 baseline against the post-training INT8-quantized
   model (per-channel weight quantization of the large attention and expert
   Linears via :func:`ouroboros.quantize.quantize_int8`), reporting both the
@@ -37,9 +37,9 @@ What is measured
 * **With vs without depth-wise batching** — the inference differentiator. Naive
   batched generation pays the maximum active recurrent depth for *every* sequence
   in the batch. Continuous depth-wise batching (``Ouroboros.generate_depthwise_
-  batched``) lets ACT-halted sequences exit the loop early while others keep
+  batched``) lets converged sequences exit the loop early while others keep
   looping, so the batch only pays for the depth each sequence actually needs. The
-  realized speedup is tied to the ACT halting-depth distribution; the literature
+  realized speedup is tied to the convergence-depth distribution; the literature
   expectation is ~2-3x.
 * **Peak memory** — peak CUDA allocated/reserved bytes per configuration,
   confirming INT8 and MLA reduce the memory footprint and that batches fit in the
@@ -200,11 +200,11 @@ def benchmark_decode(model: Ouroboros, bench_cfg: BenchConfig) -> List[LatencyRe
     latency and tokens/second in the memory-bandwidth-bound decode regime, where
     INT8 weights and the compact MLA cache help most.
 
-    Crucial recurrent-depth caveat: with a KV cache, **every** loop depth runs on
-    every decode step (no ACT early-exit), so later steps find populated keys at
-    each ``recurrent_loop_{t}`` cache key. Decode latency therefore reflects the
-    full ``n_loops`` depth, which is exactly what continuous depth-wise batching
-    later amortizes across a batch.
+    Crucial recurrent-depth caveat: the standard decode path runs the full fixed
+    ``n_loops`` on every step, so a KV cache is populated at each
+    ``recurrent_loop_{t}`` key. Decode latency therefore reflects the full
+    ``n_loops`` depth, which is exactly what continuous depth-wise batching later
+    amortizes across a batch.
 
     Args:
         model: The ``Ouroboros`` model in ``eval`` mode on ``bench_cfg.device``.
@@ -229,9 +229,9 @@ def benchmark_depth_scaling(
     Times prefill (and optionally decode) at each ``n_loops`` in
     ``bench_cfg.n_loops_sweep`` with all else fixed. Because every loop iteration
     executes a full ``TransformerBlock``, latency is expected to grow roughly
-    linearly in ``n_loops``; this curve is the quantitative motivation for ACT
-    halting (skip unneeded depth) and depth-wise batching (avoid paying max depth
-    for every sequence). It also bounds the cost of test-time depth extrapolation.
+    linearly in ``n_loops``; this curve is the quantitative motivation for
+    continuous depth-wise batching (avoid paying max depth for every sequence). It
+    also bounds the cost of test-time depth extrapolation.
 
     Args:
         model: The ``Ouroboros`` model in ``eval`` mode on ``bench_cfg.device``.
@@ -288,16 +288,16 @@ def benchmark_depthwise_batching(
 ) -> Dict[str, List[LatencyResult]]:
     """Compare naive batched generation against continuous depth-wise batching.
 
-    Two configurations on the same batch of prompts whose ACT halting depths
+    Two configurations on the same batch of prompts whose convergence depths
     differ:
 
     * **Naive batching** — ``Ouroboros.generate``: every sequence in the batch
-      runs the maximum active recurrent depth every step.
+      runs the full fixed recurrent depth every step.
     * **Continuous depth-wise batching** — ``Ouroboros.generate_depthwise_
-      batched``: ACT-halted (easy) sequences exit the loop early while harder ones
+      batched``: converged (easy) sequences exit the loop early while harder ones
       keep looping, so the batch only pays for the depth each sequence needs.
 
-    The realized speedup is tied to the ACT halting-depth distribution (reported
+    The realized speedup is tied to the convergence-depth distribution (reported
     in ``meta`` so the result is interpretable): a batch of uniformly hard prompts
     sees little gain, a mixed batch sees the most. Literature expectation is
     ~2-3x; the measured value feeds the resume multiplier.

@@ -3,10 +3,9 @@
 This package exposes the public API of the Ouroboros architecture: a
 Prelude / Recurrent / Coda design with fine-grained Mixture-of-Experts
 (routed + shared experts), switchable MLA/GQA attention, LTI-constrained
-stable input injection (spectral radius < 1 by construction), ACT halting,
-depth-wise LoRA adapters, and an INT8 / continuous-depth-wise-batching
-inference path. The model is designed to be trained on a single Google Colab
-T4 GPU (16 GB, Turing sm75, FP16).
+stable input injection (spectral radius < 1 by construction), and an INT8 /
+continuous-depth-wise-batching inference path. The model is designed to be
+trained on a single Google Colab T4 GPU (16 GB, Turing sm75, FP16).
 
 The components below are re-exported here so callers can do, e.g.::
 
@@ -25,8 +24,6 @@ from .model import Ouroboros
 from .moe import Expert, MoEFFN
 from .norm import RMSNorm
 from .recurrence import (
-    ACTHalting,
-    LoRAAdapter,
     LTIInjection,
     RecurrentBlock,
     loop_index_embedding,
@@ -52,9 +49,7 @@ __all__ = [
     "TransformerBlock",
     # Recurrence
     "loop_index_embedding",
-    "LoRAAdapter",
     "LTIInjection",
-    "ACTHalting",
     "RecurrentBlock",
     # Model
     "Ouroboros",

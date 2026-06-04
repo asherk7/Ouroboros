@@ -4,12 +4,11 @@
 > scratch in PyTorch. It follows a **Prelude → Recurrent → Coda** design with
 > fine-grained Mixture-of-Experts (routed + shared experts), switchable
 > **MLA / GQA** attention, **LTI-constrained** stable injection (spectral radius
-> `< 1` by construction), **ACT** adaptive halting, depth-wise **LoRA** adapters,
-> and — beyond the reference literature — **INT8** post-training quantization with
-> **continuous depth-wise batching** for inference.
+> `< 1` by construction), and — beyond the reference literature — **INT8**
+> post-training quantization with **continuous depth-wise batching** for inference.
 
 This document is the detailed architecture reference. It opens with the canonical
-forward-pass data-flow diagram, then walks all **17 components** in dependency
+forward-pass data-flow diagram, then walks all **15 components** in dependency
 order. For each component you get: *what it is*, *why it exists* (the problem it
 solves in a looped transformer), *how it works* (math/equations, enough to
 implement without any reference repo), *exact tensor shapes & dtypes*, *key
@@ -19,8 +18,7 @@ pipeline. A **key design properties** summary table closes the document.
 Ouroboros is an independent implementation inspired by the published
 recurrent-depth transformer literature — primarily *Parcae* (Prairie et al.,
 2026), *DeepSeek-V2* (2024), *DeepSeekMoE* (Dai et al., 2024), *DeepSeek-V3*
-(2024), *Universal Transformers* (Dehghani et al., 2018), *Adaptive Computation
-Time* (Graves, 2016), and *Relaxed Recursive Transformers* (Bae et al., 2024).
+(2024), and *Universal Transformers* (Dehghani et al., 2018).
 See [`READING_LIST.md`](./READING_LIST.md) for the full bibliography.
 
 **Target hardware:** a single Google Colab **T4** (16 GB VRAM, Turing `sm75`,
@@ -35,7 +33,7 @@ for this reality.
 1. [Forward-pass data flow](#1-forward-pass-data-flow)
 2. [The LTI recurrence in one line](#2-the-lti-recurrence-in-one-line)
 3. [Notation & shape conventions](#3-notation--shape-conventions)
-4. [The 17 components](#4-the-17-components)
+4. [The 15 components](#4-the-15-components)
    - [(1) OuroborosConfig](#1-ouroborosconfig--configpy)
    - [(2) RMSNorm](#2-rmsnorm--normpy)
    - [(3) RoPE](#3-rope--ropepy)
@@ -45,14 +43,12 @@ for this reality.
    - [(7) MoEFFN](#7-moeffn--moepy)
    - [(8) TransformerBlock](#8-transformerblock--blockpy)
    - [(9) loop_index_embedding](#9-loop_index_embedding--recurrencepy)
-   - [(10) LoRAAdapter](#10-loraadapter--recurrencepy)
-   - [(11) LTIInjection](#11-ltiinjection--recurrencepy)
-   - [(12) ACTHalting](#12-acthalting--recurrencepy)
-   - [(13) RecurrentBlock](#13-recurrentblock--recurrencepy)
-   - [(14) Ouroboros](#14-ouroboros--modelpy)
-   - [(15) KV cache & autoregressive generation](#15-kv-cache--autoregressive-generation--modelpy)
-   - [(16) INT8 quantization](#16-int8-quantization--quantizepy)
-   - [(17) Continuous depth-wise batching](#17-continuous-depth-wise-batching--modelpy)
+   - [(10) LTIInjection](#10-ltiinjection--recurrencepy)
+   - [(11) RecurrentBlock](#11-recurrentblock--recurrencepy)
+   - [(12) Ouroboros](#12-ouroboros--modelpy)
+   - [(13) KV cache & autoregressive generation](#13-kv-cache--autoregressive-generation--modelpy)
+   - [(14) INT8 quantization](#14-int8-quantization--quantizepy)
+   - [(15) Continuous depth-wise batching](#15-continuous-depth-wise-batching--modelpy)
 5. [Key design properties (summary table)](#5-key-design-properties-summary-table)
 
 ---
@@ -78,12 +74,9 @@ The canonical end-to-end data flow (spec §3). This same diagram appears in the
  │    h_loop   = loop_index_embedding(h, t, loop_dim)   # sinusoid  │
  │    combined = RMSNorm(h_loop + e)                                │
  │    trans    = TransformerBlock(combined, ...)  # MLA/GQA + MoE   │
- │    trans    = trans + LoRAAdapter(trans, t)    # depth-wise LoRA │
  │    h        = LTIInjection(h, e, trans)  # h = A·h + B·e + trans │
- │    p        = ACTHalting(h)              # per-position halt prob │
- │    accumulate ACT-weighted h into h_out; halt converged positions│
  └──────────────────────────────────────────────────────────────────┘
-      │  x := h_out (B, T, dim)
+      │  x := h (B, T, dim) — final hidden state after n_loops
       ▼
  [Coda]  coda_layers × TransformerBlock (dense SwiGLU FFN), run ONCE
       │  x (B, T, dim)
@@ -159,7 +152,7 @@ path (§4 gotcha). `freqs_cis` buffers are `complex64`.
 
 ---
 
-## 4. The 17 components
+## 4. The 15 components
 
 Presented in dependency order: each component only depends on those above it.
 Public signatures are quoted **verbatim** from the spec — the `.py` stubs must
@@ -210,9 +203,7 @@ class OuroborosConfig:
     n_experts_per_tok: int = 2      # top-K routed per token
     expert_dim: int = 256           # fine-grained expert hidden width
 
-    # --- Recurrence / stability / halting ---
-    act_threshold: float = 0.99     # ACT cumulative-probability halting threshold
-    lora_rank: int = 8              # depth-wise LoRA bottleneck rank
+    # --- Recurrence ---
     loop_index_dim: Optional[int] = None  # channels receiving loop-index embedding; None -> dim // 8
 
     # --- Load balancing (Ouroboros completes what reference impls leave as a stub) ---
@@ -356,11 +347,11 @@ an **isometry** — it preserves the L2 norm of every feature pair exactly. Posi
 - **The caller slices `freqs_cis`**, not `apply_rope`. `apply_rope` is positionless;
   the model slices `freqs_cis[start_pos : start_pos + T]` so cached decode tokens
   get the correct absolute positions. Forgetting this gives every decoded token a
-  position-0 (identity) rotation and generation degrades (see §3, §14, §15).
+  position-0 (identity) rotation and generation degrades (see §3, §12, §13).
 - **Compute in fp32, cast back.** The complex multiply is done on `x.float()` then
   cast to `x.dtype`, mirroring RMSNorm's fp32 safety.
-- **Two differently-sized buffers exist** (one for GQA, one for MLA) — see §14,
-  component 14. GQA rotates the full `dim // n_heads`; MLA rotates only
+- **Two differently-sized buffers exist** (one for GQA, one for MLA) — see §12,
+  component 12. GQA rotates the full `dim // n_heads`; MLA rotates only
   `qk_rope_head_dim`.
 
 **Where it fits.** Inside both attention back-ends, applied to Q and K. The
@@ -424,7 +415,7 @@ along `S` across decode steps and `.detach()`ed.
 - **Mask dtype must match activation dtype.** An `fp32` mask added to `fp16`/`bf16`
   logits upcasts the attention matrix to `fp32`; the subsequent matmul against a
   `bf16` `V` in the fallback path then mismatches dtypes (or silently upcasts and
-  costs memory). Build the mask in `x.dtype` (§3, §14).
+  costs memory). Build the mask in `x.dtype` (§3, §12).
 - **FA2-on-T4 reality (surface this honestly).** FlashAttention-2's prebuilt
   wheels target Ampere `sm80`+/Hopper. On Turing (T4, `sm75`) the `flash-attn`
   package is forward-only and frequently fails to build. The realistic, robust
@@ -506,7 +497,7 @@ KV cache entry:
 - **`n_kv_heads` is irrelevant to MLA** — it is a GQA-only knob. With
   `attn_type="mla"` the config's `n_kv_heads` is simply ignored.
 - **MLA needs its own RoPE buffer** sized to `qk_rope_head_dim`, separate from the
-  GQA buffer sized to `dim // n_heads`. The model precomputes both (§14, gotcha 2).
+  GQA buffer sized to `dim // n_heads`. The model precomputes both (§12, gotcha 2).
 - **`k_rope` is shared across heads** (computed once from `k_rope_raw`, then
   expanded), and it is cached **already rotated** — like GQA, retrieval needs no
   re-rotation. `c_kv` is cached **unrotated** because `K_nope` carries no
@@ -517,7 +508,7 @@ KV cache entry:
 
 **Where it fits.** Selected inside every `TransformerBlock` when
 `attn_type == "mla"` — Prelude, Recurrent, and Coda. Compared head-to-head against
-GQA in [`EXPERIMENTS.md`](./EXPERIMENTS.md) (experiment 3).
+GQA in [`EXPERIMENTS.md`](./EXPERIMENTS.md) (experiment 2).
 
 ---
 
@@ -536,7 +527,7 @@ class Expert(nn.Module):
 expert* inside `MoEFFN`, as each *shared expert*, **and** as the dense FFN in the
 Prelude/Coda `TransformerBlock`s. One class, three roles — only the hidden width
 differs. SwiGLU consistently outperforms ReLU/GELU MLPs at equal parameter budget
-(see [`DESIGN_DECISIONS.md`](./DESIGN_DECISIONS.md#8)).
+(see [`DESIGN_DECISIONS.md`](./DESIGN_DECISIONS.md#7)).
 
 **How it works.**
 
@@ -619,14 +610,14 @@ balancing inert. Ouroboros closes that gap:
 2. `update_router_bias()` nudges the bias **down** for overloaded experts and
    **up** for underloaded ones:
    ```
-   router_bias += router_bias_update_rate · sign(mean_load − load)
+   router_bias -= router_bias_update_rate · sign(load − mean_load)
    ```
    so overloaded experts (`load > mean`) get a negative nudge (picked less),
    underloaded experts get a positive nudge (picked more).
 3. The **training loop calls it every step** (`@torch.no_grad()`).
 
 This is a concrete engineering-maturity win — call it out explicitly. (Spec §5.4,
-[`DESIGN_DECISIONS.md`](./DESIGN_DECISIONS.md#9).)
+[`DESIGN_DECISIONS.md`](./DESIGN_DECISIONS.md#8).)
 
 **Inputs / outputs.** `x: (B, T, dim) → (B, T, dim)`.
 
@@ -724,62 +715,17 @@ and `loop_dim` are Python ints.
 - **Only the first `loop_dim` channels change** — the rest are untouched, by
   design. This keeps the bulk of the residual stream free for content.
 - `loop_dim` must be even (it indexes sin/cos pairs). It defaults to `dim // 8` via
-  `cfg.loop_index_dim` (see component 13).
+  `cfg.loop_index_dim` (see component 11).
 - It is a **sinusoidal** embedding, chosen over a learned per-loop table on purpose
   — sinusoids extrapolate to loop counts beyond training (depth extrapolation; see
-  [`DESIGN_DECISIONS.md`](./DESIGN_DECISIONS.md#7)).
+  [`DESIGN_DECISIONS.md`](./DESIGN_DECISIONS.md#6)).
 
 **Where it fits.** First operation inside the recurrent loop body, applied to `h`
 before it is combined with `e` and normalized.
 
 ---
 
-### (10) `LoRAAdapter` — `recurrence.py`
-
-```python
-class LoRAAdapter(nn.Module):
-    def __init__(self, dim: int, rank: int, max_loops: int): ...
-    def forward(self, x: torch.Tensor, loop_t: int) -> torch.Tensor: ...
-```
-
-**What it is.** A depth-wise **Low-Rank Adaptation** delta (Relaxed Recursive
-Transformers, Bae et al., 2024): a small per-loop correction added to the shared
-block's output.
-
-**Why it exists.** It bridges two extremes. *Pure weight-tying* (identical weights
-every loop) is parameter-efficient but limits expressiveness. *Fully distinct
-weights per loop* is expressive but throws away the parameter savings that make a
-looped model worthwhile. The LoRA adapter sits in between: a shared low-rank
-transform with a tiny **per-loop scale**, adding distinct behavior at each depth
-for negligible parameter cost.
-
-**How it works.**
-
-```
- delta(x, t) = ( down(x) ⊙ scale[t] ) @ B
-```
-
-- `down: Linear(dim, rank)` — shared across all loops.
-- `B: Parameter(rank, dim)` (init ~`0.02`) — shared across all loops.
-- `scale: Embedding(max_loops, rank)` — **per-loop** element-wise gain on the
-  rank-`r` bottleneck. This is the only depth-specific parameter.
-
-**Inputs / outputs.** `x: (B, T, dim) → (B, T, dim)` (the delta), added to the
-transformer-block output. `loop_t` is a Python int.
-
-**Gotcha — depth extrapolation clamp.** At inference, `loop_t` can exceed
-`max_loops − 1` (running deeper than training). **Clamp** the lookup index to the
-last learned scale (`min(loop_t, max_loops − 1)`) rather than indexing the
-embedding out of range. Without this, depth extrapolation crashes instead of
-gracefully reusing the deepest learned correction. (Spec §5, component 10 gotcha.)
-
-**Where it fits.** Inside the recurrent loop, applied to the `TransformerBlock`
-output before the LTI injection: `trans = trans + LoRAAdapter(trans, t)`.
-Constructed with `max_loops = cfg.max_loop_iters`.
-
----
-
-### (11) `LTIInjection` — `recurrence.py`
+### (10) `LTIInjection` — `recurrence.py`
 
 ```python
 class LTIInjection(nn.Module):
@@ -851,47 +797,11 @@ The update rule:
 
 **Where it fits.** The recurrence's update step:
 `h = LTIInjection(h, e, transformer_out)`, run once per loop iteration after the
-LoRA-adjusted transformer output is available.
+transformer output is available.
 
 ---
 
-### (12) `ACTHalting` — `recurrence.py`
-
-```python
-class ACTHalting(nn.Module):
-    def __init__(self, dim: int): ...
-    def forward(self, h: torch.Tensor) -> torch.Tensor: ...    # (B,T,dim) -> (B,T) in (0,1)
-```
-
-**What it is.** The Adaptive Computation Time halting head (Graves, 2016): a
-learned per-position **halting probability** predicted at each loop iteration.
-
-**Why it exists.** Not every token needs the same amount of refinement — easy
-tokens converge in a couple of loops, hard ones need more. A fixed loop count
-either under-computes hard tokens or wastes compute on easy ones. ACT lets each
-position **halt independently**, all within the same batch, and is the basis for
-the continuous depth-wise batching differentiator (component 17). It also gives
-looped transformers their Turing-completeness story (Universal Transformers,
-Dehghani et al., 2018).
-
-**How it works.**
-
-```
- p = sigmoid( Linear(dim, 1)(h) ).squeeze(-1)        # (B, T), per-position halt prob in (0, 1)
-```
-
-The *accumulation logic* (the ACT remainder trick, cumulative-probability halting)
-lives in `RecurrentBlock` (component 13) — this module only produces the
-per-position halting score from the current hidden state.
-
-**Inputs / outputs.** `h: (B, T, dim) → (B, T)`, values in `(0, 1)`.
-
-**Where it fits.** Called once per loop iteration on the updated `h`, feeding the
-`RecurrentBlock`'s halting accumulator.
-
----
-
-### (13) `RecurrentBlock` — `recurrence.py`
+### (11) `RecurrentBlock` — `recurrence.py`
 
 ```python
 class RecurrentBlock(nn.Module):
@@ -900,59 +810,37 @@ class RecurrentBlock(nn.Module):
 ```
 
 **What it is.** The looped core of Ouroboros — **one** `TransformerBlock` (with
-MoE) run for `n_loops` iterations, wrapped in loop-index conditioning, depth-wise
-LoRA, LTI injection, and ACT halting. This is where the entire architecture's
-identity lives.
+MoE) run for a fixed `n_loops` iterations, wrapped in loop-index conditioning and
+LTI injection. This is where the entire architecture's identity lives.
 
 **Why it exists.** It implements "same weights, more loops → deeper reasoning, no
-parameter growth." All the recurrence machinery (components 9–12) is orchestrated
-here into the canonical loop body from §1.
+parameter growth." The recurrence machinery (components 9–10) is orchestrated here
+into the canonical loop body from §1.
 
 **How it works — owned submodules.**
 
 ```python
 self.block     = TransformerBlock(cfg, use_moe=True)
 self.injection = LTIInjection(cfg.dim)
-self.act       = ACTHalting(cfg.dim)
-self.lora      = LoRAAdapter(cfg.dim, cfg.lora_rank, cfg.max_loop_iters)
 self.norm      = RMSNorm(cfg.dim)
 self.loop_dim  = cfg.loop_index_dim or cfg.dim // 8
 ```
 
-**Loop body** (per iteration `t = 0 … n_loops−1`):
+**Loop body** (per iteration `t = 0 … n_loops−1`, fixed depth, no early exit):
 
 ```
  h_loop   = loop_index_embedding(h, t, loop_dim)              # depth signal
  combined = norm(h_loop + e)                                   # re-read frozen input
  trans    = block(combined, freqs_cis, mask, kv_cache,
                   cache_key=f"recurrent_loop_{t}")             # MLA/GQA + MoE
- trans    = trans + lora(trans, t)                             # per-depth LoRA delta
  h        = injection(h, e, trans)                             # h = A·h + B·e + trans
- p        = act(h)                                             # (B, T) halt prob
- # --- ACT remainder accumulation ---
- still_running = ~halted
- remainder     = (1 − cumulative_p).clamp(min=0)
- weight        = where(cumulative_p + p >= act_threshold, remainder, p)
- weight        = weight * still_running          # halted positions contribute 0
- h_out        += weight.unsqueeze(-1) * h
- cumulative_p += p * still_running
- halted        = halted | (cumulative_p >= act_threshold)
- if halted.all() and kv_cache is None:           # ← see CRITICAL gotcha
-     break
 ```
 
-State maintained across the loop: `halted (B, T) bool`, `cumulative_p (B, T)`,
-`h_out (B, T, dim)`. The returned value is the **ACT-weighted sum** of hidden
-states — each position's `h` is accumulated with the weight assigned on the step
-it converged, so every position contributes a total probability mass of ~1.
-
-**The ACT remainder trick (why `still_running` gating matters).** Once a position's
-`cumulative_p + p` crosses `act_threshold`, its weight becomes the *remaining*
-mass `1 − cumulative_p` (so its total weight sums to ~1), and it must contribute
-**exactly once** more, then nothing. Because `act_threshold < 1`, an un-gated
-remainder would leak a non-zero weight every subsequent step. Multiplying by
-`still_running` ensures a halted position contributes on its halting step and
-zero thereafter.
+After `n_loops` iterations the final hidden state `h` is returned. The loop runs a
+**fixed** number of iterations for every position — there is no adaptive halting,
+which keeps the core loop simple and the KV cache trivially correct (see gotcha
+below). See [`DESIGN_DECISIONS.md`](./DESIGN_DECISIONS.md#5) for why a fixed loop
+count is preferred over adaptive halting at this scope.
 
 **Inputs / outputs.**
 
@@ -964,27 +852,18 @@ zero thereafter.
 | `mask`      | `(1, 1, T, S)` or `None`           | additive, activation dtype             |
 | `n_loops`   | `int` or `None` (→ `max_loop_iters`)| recurrent depth                       |
 | `kv_cache`  | `dict` or `None`                   | distinct key per loop depth            |
-| out         | `(B, T, dim)`                      | ACT-weighted sum                       |
+| out         | `(B, T, dim)`                      | final hidden state after `n_loops`     |
 
-**CRITICAL gotcha — the headline subtlety (KV-cache ⊗ ACT conflict).** Early-exit
-(`if halted.all(): break`) is valid **only when `kv_cache is None`**. With a KV
-cache, **every loop depth must run on every forward pass**, because a later decode
-step that loops to depth `d` will read keys from cache key
-`f"recurrent_loop_{d}"` — and if an earlier step short-circuited before depth `d`,
-that key is unpopulated and decode reads garbage (or crashes). So:
-
-```python
-if halted.all() and kv_cache is None:
-    break
-```
-
-This same constraint is the crux of continuous depth-wise batching (component 17)
-and the single most important correctness invariant in the system. (Spec §5.1.)
-
-**Other gotchas.**
+**Gotchas.**
 
 - **Distinct cache key per depth** — `f"recurrent_loop_{t}"` — so caches across
   loop depths never collide.
+- **The fixed-depth loop keeps the KV cache trivially correct.** Because every
+  forward pass runs all `n_loops` depths, a cache is populated at every
+  `recurrent_loop_{t}` key, so later decode steps always find the keys they need.
+  Per-sequence early exit — used only by inference-time continuous depth-wise
+  batching — is handled separately in component 15, where its cache implications
+  are addressed.
 - **`e` is re-read every loop** (inside `norm(h_loop + e)` *and* in the LTI `B·e`
   term) — it is the anti-drift anchor that keeps the prompt alive across arbitrary
   depth.
@@ -994,7 +873,7 @@ receives `h = e = (Prelude output)` and returns the latent fed to the Coda.
 
 ---
 
-### (14) `Ouroboros` — `model.py`
+### (12) `Ouroboros` — `model.py`
 
 ```python
 class Ouroboros(nn.Module):
@@ -1007,13 +886,13 @@ class Ouroboros(nn.Module):
     def generate(self, input_ids, max_new_tokens=64, n_loops=8, temperature=1.0, top_k=50): ...
     @torch.no_grad()
     def generate_depthwise_batched(self, input_ids, max_new_tokens=64, max_loops=None,
-                                   temperature=1.0, top_k=50) -> torch.Tensor: ...   # Phase 7, see (17)
+                                   convergence_tol=1e-3, temperature=1.0, top_k=50): ...  # Phase 7, see (15)
 ```
 
 **What it is.** The full top-level model: `Embedding → Prelude → RecurrentBlock →
 Coda → RMSNorm → tied LM head`, plus generation entry points.
 
-**Why it exists.** It wires the 13 components above into the end-to-end forward
+**Why it exists.** It wires the 11 components above into the end-to-end forward
 pass of §1, owns the two RoPE buffers, the embedding/head weight tying, weight
 init, and the causal mask — i.e. everything that is global to the architecture
 rather than local to a layer.
@@ -1071,19 +950,19 @@ on/below the diagonal, `-inf` above (`torch.triu(full(-inf), diagonal=1)`),
    `qk_rope_head_dim`. The model precomputes **both** and selects per `attn_type`
    at forward. Mixing them up silently breaks one back-end. (Spec §5.2.)
 3. **Mask only when `T > 1`.** Single-token decode (`T=1`) needs no causal mask;
-   building one would be wrong shape-wise against the cached `S`. (See §15.)
+   building one would be wrong shape-wise against the cached `S`. (See §13.)
 4. **Weight init ignores residual-depth scaling (improvement note).** Naive
    `N(0, init_std)` on all weights does not account for the variance a *looped*
    model accumulates across loops. Document GPT-2-style `1/√(2·n_eff)` scaling on
    residual output projections (and optionally QK-norm / logit z-loss) as a
-   stability improvement to ablate (spec §5.9, §14 init note).
+   stability improvement to ablate (spec §5.9, §12 init note).
 
 **Where it fits.** It *is* the model — Prelude, Recurrent, and Coda all hang off
 it, and it owns everything global.
 
 ---
 
-### (15) KV cache & autoregressive generation — `model.py`
+### (13) KV cache & autoregressive generation — `model.py`
 
 *(Covered by `forward` and `generate` above; this section makes the caching
 contract explicit.)*
@@ -1116,12 +995,15 @@ token's contribution each step.
 
 **Gotchas.**
 
-- **`start_pos` is load-bearing** (see §14 gotcha 1).
+- **`start_pos` is load-bearing** (see §12 gotcha 1).
 - **A correctness invariant worth a test:** cached single-token decode logits must
   match a full-context forward pass over the same sequence (within numerical
   tolerance). This is the canonical KV-cache regression test (Phase 5 / Phase 6).
-- **The ACT short-circuit must be disabled when caching** (§13 critical gotcha) —
-  the cache and the recurrence interact precisely here.
+- **The fixed-depth recurrent loop keeps caching simple** (§11) — every
+  `recurrent_loop_{t}` key is populated on every forward, so the standard
+  `generate` path has no cache/recurrence edge case. Per-sequence early exit is
+  introduced only by continuous depth-wise batching, which handles its own cache
+  implications (§15).
 
 **Where it fits.** Spans all three stages (every layer/loop writes to the same
 cache dict). Lives on the model; exercised by `generate` and
@@ -1129,7 +1011,7 @@ cache dict). Lives on the model; exercised by `generate` and
 
 ---
 
-### (16) INT8 quantization — `quantize.py`
+### (14) INT8 quantization — `quantize.py`
 
 ```python
 def quantize_int8(model: "Ouroboros", method: str = "dynamic") -> "Ouroboros": ...
@@ -1184,52 +1066,61 @@ changing the data flow.
 
 ---
 
-### (17) Continuous depth-wise batching — `model.py`
+### (15) Continuous depth-wise batching — `model.py`
 
 ```python
 @torch.no_grad()
 def generate_depthwise_batched(self, input_ids, max_new_tokens=64, max_loops=None,
-                               temperature=1.0, top_k=50) -> torch.Tensor: ...
+                               convergence_tol=1e-3, temperature=1.0, top_k=50): ...
 ```
 
 **What it is.** **THE** inference differentiator (the other half of resume bullet
 3). Because all sequences share the same recurrent weights, different sequences in
-one batch can **exit the loop at different depths** (ACT-driven): easy sequences
-halt early, hard ones loop more — all in a single batch — instead of every
-sequence paying the maximum depth.
+one batch can **exit the loop at different depths** via a non-learned, *convergence
+based* early-exit: a sequence stops looping once its hidden state stops changing
+(`‖h_{t+1} − h_t‖ < convergence_tol`). Easy sequences converge fast and exit early,
+hard ones loop deeper — all in a single batch — instead of every sequence paying
+the maximum depth. (No learned halting head; this is the cut-scope replacement for
+adaptive halting — see [`DESIGN_DECISIONS.md`](./DESIGN_DECISIONS.md#5).)
 
-**Why it exists.** With a fixed loop count, the whole batch runs to max depth even
-if most sequences converged early — wasted compute proportional to the gap between
-mean and max halting depth. Continuous depth-wise batching tightens that to the
-*active* depth, tying throughput directly to the ACT halting distribution.
+**Why it exists.** With a uniform fixed loop count, the whole batch runs to
+`max_loops` even if most sequences converged early — wasted compute proportional to
+the gap between mean and max convergence depth. Continuous depth-wise batching
+tightens that to the *active* depth, tying throughput directly to the
+convergence-depth distribution.
 
 **How it works — and the central challenge.** The hard part is the
-**KV-cache ⊗ ACT interaction** (the same invariant as §13). A sequence that exits
-at depth `d` leaves cache keys `recurrent_loop_{d..n}` **unpopulated**; a later
-decode step for that sequence that needs to loop deeper would read missing keys.
-Three solutions to weigh (document the chosen one with measured tradeoffs):
+**KV-cache ⊗ early-exit interaction**. A sequence that converges and exits at depth
+`d` leaves cache keys `recurrent_loop_{d..n}` **unpopulated**; a later decode step
+for that sequence that needs to loop deeper would read missing keys. Three
+solutions to weigh (document the chosen one with measured tradeoffs):
 
 1. **Run-to-max-active + mask.** Each step, run all sequences to the **maximum
-   active depth currently in the batch**, masking finished ones. Simple, correct,
-   keeps the cache dense; gains scale with the spread of halting depths.
+   active depth currently in the batch**, masking converged ones. Simple, correct,
+   keeps the cache dense; gains scale with the spread of convergence depths.
 2. **Ragged / compacted per-sequence cache.** Track per-sequence depth and
    maintain a ragged or compacted cache so each sequence stores only the depths it
    actually ran. Most memory-efficient, most bookkeeping.
 3. **Bucket by predicted depth.** Sort/bucket sequences so a batch shares a depth,
    removing the ragged-cache problem at the cost of a scheduling pass.
 
-**Inputs / outputs.** `generate_depthwise_batched(input_ids (B, T)) →
-(B, T + max_new_tokens)` `long`. `max_loops` caps the deepest any sequence may run.
+**Chosen approach: (1) run-to-max-active + mask** — the only option whose cache
+stays dense and rectangular, so the existing `recurrent_loop_{t}` keying and the
+standard KV-cache path are reused verbatim. Options 2–3 are future optimizations.
 
-**Throughput expectation.** Literature suggests ~**2–3×** depending on the ACT
-halting distribution; the *measured* number on T4 fills in resume bullet 3. Tie
-the result back to the observed halting-depth histogram (see
-[`EXPERIMENTS.md`](./EXPERIMENTS.md), experiment 6).
+**Inputs / outputs.** `generate_depthwise_batched(input_ids (B, T)) →
+(B, T + max_new_tokens)` `long`. `max_loops` caps the deepest any sequence may run;
+`convergence_tol` sets the per-sequence early-exit threshold.
+
+**Throughput expectation.** Literature suggests ~**2–3×** depending on the
+convergence-depth distribution; the *measured* number on T4 fills in resume bullet
+3. Tie the result back to the observed convergence-depth histogram (see
+[`EXPERIMENTS.md`](./EXPERIMENTS.md), experiment 5).
 
 **Where it fits.** An inference-time orchestration over the Recurrent stage,
 implemented on the model (Phase 7). It does not change the math of any component —
-it changes *which depths run for which sequences*, subject to the §13 cache
-invariant.
+it changes *which depths run for which sequences*, subject to the cache-population
+invariant above.
 
 ---
 
@@ -1237,19 +1128,18 @@ invariant.
 
 | Property                          | Component(s)                  | Mechanism                                                            | Why it matters                                                                  |
 | --------------------------------- | ----------------------------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| **Stable looped training**        | LTIInjection (11)             | Diagonal `A` via ZOH, `ρ(A) < 1` by construction; log-space clamp `(-20,20)` | Converges at high LR with no clipping/normalization band-aids (resume bullet 2) |
-| **Depth = compute, not params**   | RecurrentBlock (13)           | One shared block looped `n_loops` times                             | Deeper reasoning with zero parameter growth                                     |
-| **Depth extrapolation**           | RecurrentBlock (13), LoRA (10), loop-index (9) | Sinusoidal depth signal + clamped per-loop scale  | Train at `n_loops=8`, run deeper at inference                                   |
-| **Adaptive per-token compute**    | ACTHalting (12), RecurrentBlock (13) | Cumulative-probability halting + remainder trick             | Easy tokens halt early; hard tokens loop more — in one batch                    |
+| **Stable looped training**        | LTIInjection (10)             | Diagonal `A` via ZOH, `ρ(A) < 1` by construction; log-space clamp `(-20,20)` | Converges at high LR with no clipping/normalization band-aids (resume bullet 2) |
+| **Depth = compute, not params**   | RecurrentBlock (11)           | One shared block looped a fixed `n_loops` times                     | Deeper reasoning with zero parameter growth                                     |
+| **Depth extrapolation**           | RecurrentBlock (11), loop-index (9) | Sinusoidal depth signal, well-defined at any loop count       | Train at `n_loops=8`, run deeper at inference                                   |
 | **Breadth in the loop**           | MoEFFN (7), Expert (6)        | Fine-grained routed + always-on shared experts                      | Large capacity, sparse top-K compute, no per-domain bottleneck                  |
-| **Real load balancing**           | MoEFFN.update_router_bias (7) | Aux-loss-free bias nudged `±rate·sign(mean−load)` each step          | Balanced experts without an auxiliary loss; closes the reference-impl stub gap  |
+| **Real load balancing**           | MoEFFN.update_router_bias (7) | Aux-loss-free bias nudged `-= rate·sign(load−mean)` each step        | Balanced experts without an auxiliary loss; closes the reference-impl stub gap  |
 | **Switchable attention**          | GQAttention (4), MLAttention (5) | `attn_type` flag; dual RoPE buffers                              | GQA (FA2 fast path) ↔ MLA (compressed KV cache) without code changes            |
-| **Cheap decode memory**           | MLAttention (5), KV cache (15)| Cache compressed `c_kv` + shared `k_rope` (MLA) / grouped KV (GQA)  | Longer context & larger batch on a 16 GB T4                                      |
-| **Anti-drift recurrence**         | LTIInjection (11), RecurrentBlock (13) | `B·e` + `norm(h_loop+e)` re-inject frozen input every loop  | Prompt stays alive across arbitrary depth                                       |
+| **Cheap decode memory**           | MLAttention (5), KV cache (13)| Cache compressed `c_kv` + shared `k_rope` (MLA) / grouped KV (GQA)  | Longer context & larger batch on a 16 GB T4                                      |
+| **Anti-drift recurrence**         | LTIInjection (10), RecurrentBlock (11) | `B·e` + `norm(h_loop+e)` re-inject frozen input every loop  | Prompt stays alive across arbitrary depth                                       |
 | **No learned position table**     | RoPE (3)                      | Complex-phasor rotation, norm-preserving isometry                   | Relative positions, clean extrapolation, zero position params                   |
-| **Inference throughput**          | INT8 (16), depth-wise batching (17) | Per-channel INT8 weights + per-sequence early exit            | Memory ↓ + ~2–3× throughput on T4 (resume bullet 3)                             |
-| **Correctness under caching**     | RecurrentBlock (13), gen (15/17) | Early-exit only when `kv_cache is None`; deterministic cache keys | The headline subtlety — cached decode matches full-context forward              |
-| **fp16 numerical safety**         | RMSNorm (2), RoPE (3), LTI (11) | fp32 reductions; dtype-matched additive mask                       | Stable training/inference in fp16 on Turing                                     |
+| **Inference throughput**          | INT8 (14), depth-wise batching (15) | Per-channel INT8 weights + per-sequence convergence early exit | Memory ↓ + ~2–3× throughput on T4 (resume bullet 3)                            |
+| **Correctness under caching**     | RecurrentBlock (11), gen (13/15) | Fixed-depth loop populates every cache key; deterministic keys   | Cached decode matches full-context forward                                      |
+| **fp16 numerical safety**         | RMSNorm (2), RoPE (3), LTI (10) | fp32 reductions; dtype-matched additive mask                       | Stable training/inference in fp16 on Turing                                     |
 | **Small-scale parameter economy** | OuroborosConfig (1), Expert (6) | `vocab_size=8192`, tied embeddings, `dim*4//3` dense FFN            | Keeps the budget on the transformer, not a giant lookup table (T4-realistic)    |
 
 ---

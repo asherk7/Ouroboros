@@ -26,25 +26,24 @@ lands right before you build the thing it describes:
 > **Phase 1 (Skeleton):** RoFormer/RoPE → RMSNorm → SwiGLU.
 > **Phase 2 (Attention):** GQA → DeepSeek-V2 (MLA) → FlashAttention-2.
 > **Phase 3 (MoE):** DeepSeekMoE → DeepSeek-V3 (aux-loss-free bias).
-> **Phase 4 (Recurrence — the heart of the project):** Universal Transformers →
-> Adaptive Computation Time → Relaxed Recursive Transformers → **Parcae**
-> (read this one closely; it is the stability thesis of the whole project).
+> **Phase 4 (Recurrence — the heart of the project):** Universal Transformers
+> (context) → **Parcae** (read this one closely; it is the stability thesis of the
+> whole project).
 > **Phase 5 (Full model / depth extrapolation):** Reasoning with Latent Thoughts
 > (looped-transformer theory) → COCONUT (context).
 > **Phase 7 (Inference optimization):** LLM.int8().
 
 If you only have time for five, read in this order: **Parcae**, **DeepSeek-V2**,
-**DeepSeekMoE**, **Universal Transformers**, **DeepSeek-V3**.
+**DeepSeekMoE**, **DeepSeek-V3**, **RoFormer/RoPE**.
 
 ---
 
 ## 1. Recurrence & Stability
 
 The defining axis of Ouroboros: a Prelude/Recurrent/Coda model whose middle
-block is looped to variable depth, with stability guaranteed by construction
+block is looped to a fixed depth, with stability guaranteed by construction
 rather than patched with gradient clipping. These papers justify the
-[`RecurrentBlock`](./ARCHITECTURE.md), [`LTIInjection`](./ARCHITECTURE.md),
-[`ACTHalting`](./ARCHITECTURE.md), and [`LoRAAdapter`](./ARCHITECTURE.md)
+[`RecurrentBlock`](./ARCHITECTURE.md) and [`LTIInjection`](./ARCHITECTURE.md)
 components and back resume bullets 1 and 2.
 
 ### Parcae: Scaling Laws for Stable Looped Language Models
@@ -67,40 +66,41 @@ components and back resume bullets 1 and 2.
 ### Universal Transformers
 - **Authors / Year:** Dehghani et al., 2018
 - **Link:** https://arxiv.org/abs/1807.03819
-- **Maps to:** `RecurrentBlock`, `ACTHalting`, the weight-tied-looped-depth idea.
+- **Maps to:** `RecurrentBlock`, the weight-tied-looped-depth idea (context).
 - **Focus on:** the recurrent (depth-as-time) formulation of a transformer with
-  **shared weights applied repeatedly**, and the per-position **ACT halting**
-  applied to recurrence depth (their §2.2 on dynamic halting; the halting figure).
-  This is the conceptual ancestor of the whole looped design — note how a single
-  shared block run T times differs from T distinct stacked layers, which directly
-  motivates our per-loop LoRA and loop-index embedding.
-- **Priority:** **MUST-READ.**
+  **shared weights applied repeatedly** — the conceptual ancestor of the whole
+  looped design; note how a single shared block run T times differs from T distinct
+  stacked layers, which motivates the loop-index embedding. (The paper also
+  introduces per-position **ACT halting** over recurrence depth, which Ouroboros
+  deliberately does **not** use — it runs a fixed loop count — so read the halting
+  section as background, not as something to implement.)
+- **Priority:** **CONTEXT.**
 
 ### Adaptive Computation Time for Recurrent Neural Networks
 - **Authors / Year:** Graves, 2016
 - **Link:** https://arxiv.org/abs/1603.08983
-- **Maps to:** `ACTHalting`, the ACT remainder/accumulation logic in
-  `RecurrentBlock`.
-- **Focus on:** the **halting-probability mechanism** and the **remainder trick** —
-  accumulate per-step halting probabilities until a threshold, then weight the
-  final step by `1 - cumulative_p` so contributions sum to 1. This is *exactly*
-  the `weight = where(cumulative_p + p >= act_threshold, 1 - cumulative_p, p)`
-  accumulation in our loop body. Read the ponder-cost discussion to understand why
-  the threshold (`act_threshold = 0.99`) trades compute against accuracy.
-- **Priority:** **MUST-READ.**
+- **Maps to:** background for the convergence-based early exit in
+  `generate_depthwise_batched` (context).
+- **Focus on:** the **halting-probability / ponder-cost** idea — spending variable
+  computation per input. Ouroboros does **not** implement learned ACT halting (the
+  core loop is a fixed `n_loops`); instead it recovers variable depth *at inference
+  only*, via a simpler non-learned convergence test (`‖h_{t+1} − h_t‖ <
+  convergence_tol`) inside continuous depth-wise batching. Read this as the
+  intellectual background for "why variable per-input depth is worth having."
+- **Priority:** **CONTEXT.**
 
 ### Relaxed Recursive Transformers: Effective Parameter Sharing with Layer-wise LoRA
 - **Authors / Year:** Bae et al., 2024
 - **Link:** https://arxiv.org/abs/2410.20672
-- **Maps to:** `LoRAAdapter` (depth-wise LoRA).
+- **Maps to:** background on parameter-sharing in looped models (context; depth-wise
+  LoRA is **not** used in the current scope).
 - **Focus on:** the argument that **pure weight-tying is too rigid** and
-  **fully-distinct layers are too expensive**, and the LoRA-per-depth middle
-  ground — a shared down-projection and base matrix with a small per-depth
-  adapter. Map this onto our `delta(x, t) = (down(x) * scale[t]) @ B` with a
-  per-loop `scale` embedding. Note the depth-extrapolation concern: at inference
-  `loop_t` can exceed `max_loops - 1`, so the index must be **clamped** to the
-  last learned scale.
-- **Priority:** **MUST-READ.**
+  **fully-distinct layers are too expensive**, and the LoRA-per-depth middle ground.
+  Ouroboros currently sits at the **pure weight-tying** end (the single recurrent
+  block is fully shared across loops, differentiated only by the sinusoidal
+  loop-index signal) — depth-wise LoRA was cut from scope. Read this to understand
+  the tradeoff and as the natural next step if per-depth capacity is later wanted.
+- **Priority:** **CONTEXT.**
 
 ### Reasoning with Latent Thoughts: On the Power of Looped Transformers
 - **Authors / Year:** Saunshi et al., 2025
@@ -195,7 +195,7 @@ and aux-loss-free load balancing. Maps to [`MoEFFN`](./ARCHITECTURE.md) and
   many reference implementations register the bias buffer but never update it —
   we implement the update step and call it from the training loop. Read this
   carefully; it is the concrete engineering-maturity win in
-  [DESIGN_DECISIONS](./DESIGN_DECISIONS.md) #9.
+  [DESIGN_DECISIONS](./DESIGN_DECISIONS.md) #8.
 - **Priority:** **MUST-READ** (for the bias-update mechanism).
 
 ---
@@ -266,18 +266,20 @@ and `generate_depthwise_batched`; backs resume bullet 3.
   to measure the **perplexity delta** (`quantization_error`) and throughput gain.
   T4 note: Turing has INT8 tensor cores, which is exactly why INT8 (not FP16/FP8)
   is the chosen quantization target — see
-  [DESIGN_DECISIONS](./DESIGN_DECISIONS.md) #10.
+  [DESIGN_DECISIONS](./DESIGN_DECISIONS.md) #9.
 - **Priority:** **MUST-READ** (for resume bullet 3).
 
 > **Note — continuous depth-wise batching has no single source paper.** It is the
 > inference *differentiator* of Ouroboros and is developed from first principles
-> in [ARCHITECTURE](./ARCHITECTURE.md) (component 17) and
-> [DESIGN_DECISIONS](./DESIGN_DECISIONS.md) #11. The relevant background is the
-> ACT halting literature above (Graves 2016; Dehghani et al. 2018) — because
-> sequences halt at different recurrence depths, easy ones can exit the loop early
-> while hard ones loop more *within the same batch*. The central engineering
-> problem (a sequence exiting at depth `d` leaves `recurrent_loop_{d..n}` KV-cache
-> keys unpopulated) is the cache-population subtlety also flagged in component 13.
+> in [ARCHITECTURE](./ARCHITECTURE.md) (component 15) and
+> [DESIGN_DECISIONS](./DESIGN_DECISIONS.md) #10. The relevant background is the
+> adaptive-computation literature above (Graves 2016; Dehghani et al. 2018) —
+> because sequences **converge** at different recurrence depths, easy ones can exit
+> the loop early while hard ones loop more *within the same batch* (Ouroboros uses a
+> non-learned `‖Δh‖ < convergence_tol` test, not a learned halting head). The
+> central engineering problem (a sequence exiting at depth `d` leaves
+> `recurrent_loop_{d..n}` KV-cache keys unpopulated) is the cache-population subtlety
+> also flagged in component 11.
 
 ---
 
@@ -314,11 +316,9 @@ Quick lookup from each Ouroboros component to its primary references
 | `MLAttention` | ★ DeepSeek-V2 (2024) |
 | `Expert` (SwiGLU) | ★ SwiGLU (Shazeer, 2020) |
 | `MoEFFN` | ★ DeepSeekMoE (Dai et al., 2024); ★ DeepSeek-V3 (2024, bias update) |
-| `loop_index_embedding` | ★ RoFormer/RoPE (Su et al., 2021); Universal Transformers (2018) |
-| `LoRAAdapter` | ★ Relaxed Recursive Transformers (Bae et al., 2024) |
+| `loop_index_embedding` | ★ RoFormer/RoPE (Su et al., 2021); Universal Transformers (2018, context) |
 | `LTIInjection` | ★ Parcae (Prairie et al., 2026) |
-| `ACTHalting` | ★ Adaptive Computation Time (Graves, 2016); ★ Universal Transformers (2018) |
-| `RecurrentBlock` | ★ Parcae (2026); ★ Universal Transformers (2018); Reasoning with Latent Thoughts (Saunshi et al., 2025) |
+| `RecurrentBlock` | ★ Parcae (2026); Universal Transformers (2018, context); Reasoning with Latent Thoughts (Saunshi et al., 2025) |
 | `Ouroboros` (depth extrapolation) | Reasoning with Latent Thoughts (2025); COCONUT (2024) |
 | `quantize_int8` / `INT8Linear` | ★ LLM.int8() (Dettmers et al., 2022) |
-| `generate_depthwise_batched` | (no single paper — see ARCHITECTURE component 17; ACT background above) |
+| `generate_depthwise_batched` | (no single paper — see ARCHITECTURE component 15; adaptive-computation background above) |

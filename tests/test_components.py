@@ -12,9 +12,7 @@ component is implemented. The phase numbers track the project roadmap:
   :class:`~ouroboros.attention.MLAttention`.
 * Phase 3 — :class:`~ouroboros.moe.Expert`, :class:`~ouroboros.moe.MoEFFN`.
 * Phase 4 — :func:`~ouroboros.recurrence.loop_index_embedding`,
-  :class:`~ouroboros.recurrence.LoRAAdapter`,
   :class:`~ouroboros.recurrence.LTIInjection`,
-  :class:`~ouroboros.recurrence.ACTHalting`,
   :class:`~ouroboros.block.TransformerBlock`,
   :class:`~ouroboros.recurrence.RecurrentBlock`.
 
@@ -31,10 +29,8 @@ import pytest
 # name is renamed or removed. They are referenced only inside skipped bodies for
 # now, so F401 is suppressed while every test remains a stub.
 from ouroboros import (  # noqa: F401
-    ACTHalting,
     Expert,
     GQAttention,
-    LoRAAdapter,
     LTIInjection,
     MLAttention,
     MoEFFN,
@@ -63,7 +59,7 @@ def tiny_config(**overrides: object) -> OuroborosConfig:
     * A small MoE: ``n_experts=4``, ``n_shared_experts=1``,
       ``n_experts_per_tok=2``, ``expert_dim=32``.
     * Shallow recurrence: ``prelude_layers=1``, ``coda_layers=1``,
-      ``max_loop_iters=4``, ``max_seq_len=64``, ``lora_rank=4``.
+      ``max_loop_iters=4``, ``max_seq_len=64``.
 
     Args:
         **overrides: Field values that replace the tiny defaults (e.g.
@@ -327,41 +323,7 @@ def test_loop_index_embedding_only_modifies_first_loop_dim_channels() -> None:
 
 
 # ===========================================================================
-# (10) LoRAAdapter — Phase 4
-# ===========================================================================
-
-
-def test_lora_adapter_output_shape() -> None:
-    """``LoRAAdapter`` maps ``(B, T, dim)`` to a delta of shape ``(B, T, dim)``.
-
-    ``LoRAAdapter(dim, rank, max_loops)(x, loop_t)`` must return a delta tensor
-    of shape ``(B, T, dim)`` to be added to the block output.
-    """
-    pytest.skip("stub — implement in Phase 4")
-
-
-def test_lora_adapter_delta_differs_per_loop() -> None:
-    """Different ``loop_t`` values yield different LoRA deltas.
-
-    Because the per-loop ``scale`` embedding modulates the bottleneck, the delta
-    for ``loop_t=0`` must differ from the delta for ``loop_t=1`` on the same
-    input.
-    """
-    pytest.skip("stub — implement in Phase 4")
-
-
-def test_lora_adapter_clamps_index_for_depth_extrapolation() -> None:
-    """Indices beyond ``max_loops - 1`` clamp to the last learned scale.
-
-    Calling the adapter with ``loop_t >= max_loops`` must NOT raise and must
-    reuse the final learned ``scale`` row: the delta at ``loop_t = max_loops``
-    (and beyond) must equal the delta at ``loop_t = max_loops - 1``.
-    """
-    pytest.skip("stub — implement in Phase 4")
-
-
-# ===========================================================================
-# (11) LTIInjection — Phase 4
+# (10) LTIInjection — Phase 4
 # ===========================================================================
 
 
@@ -391,29 +353,6 @@ def test_lti_injection_spectral_radius_stays_below_one_after_huge_step() -> None
     adding ``+1e4``), ``get_A()`` must still be finite, NaN-free, and strictly in
     ``(0, 1)`` — the ``clamp(-20, 20)`` in log space guarantees stability by
     construction, the headline property for resume bullet 2.
-    """
-    pytest.skip("stub — implement in Phase 4")
-
-
-# ===========================================================================
-# (12) ACTHalting — Phase 4
-# ===========================================================================
-
-
-def test_act_halting_output_shape() -> None:
-    """``ACTHalting`` maps ``(B, T, dim)`` to per-position probs of shape ``(B, T)``.
-
-    The trailing size-1 channel must be squeezed so the halting probability has
-    shape ``(B, T)``.
-    """
-    pytest.skip("stub — implement in Phase 4")
-
-
-def test_act_halting_values_in_unit_interval() -> None:
-    """Halting probabilities lie in ``(0, 1)`` (sigmoid output).
-
-    Every entry of the returned ``(B, T)`` tensor must be strictly between 0 and
-    1 since it is the output of a sigmoid.
     """
     pytest.skip("stub — implement in Phase 4")
 
@@ -460,15 +399,15 @@ def test_transformer_block_selects_attention_by_attn_type() -> None:
 
 
 # ===========================================================================
-# (13) RecurrentBlock — Phase 4
+# (11) RecurrentBlock — Phase 4
 # ===========================================================================
 
 
 def test_recurrent_block_output_shape() -> None:
-    """``RecurrentBlock`` returns the ACT-weighted sum of shape ``(B, T, dim)``.
+    """``RecurrentBlock`` returns the final hidden state of shape ``(B, T, dim)``.
 
-    Given ``h`` and ``e`` of shape ``(B, T, dim)``, the looped block must return
-    ``(B, T, dim)`` (the ACT-weighted accumulation across loop depths).
+    Given ``h`` and ``e`` of shape ``(B, T, dim)``, the fixed-depth looped block
+    must return ``(B, T, dim)`` (the hidden state after ``n_loops`` iterations).
     """
     pytest.skip("stub — implement in Phase 4")
 
@@ -487,6 +426,6 @@ def test_recurrent_block_single_loop_runs() -> None:
     """A single-loop pass (``n_loops=1``) runs and returns ``(B, T, dim)``.
 
     The loop body must be well-defined for the minimal depth of one iteration
-    (no off-by-one in the ACT accumulation or cache-key construction).
+    (no off-by-one in the loop or cache-key construction).
     """
     pytest.skip("stub — implement in Phase 4")

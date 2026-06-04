@@ -23,7 +23,7 @@ forward pass is a **Prelude / Recurrent / Coda** design::
           ▼
      [Recurrent Block]  one TransformerBlock (MoE) looped n_loops times,
                         h_{t+1} = A·h_t + B·e + Transformer(h_t, e), ρ(A) < 1
-          │  x := h_out (ACT-weighted sum over loop depths)
+          │  x := h (final hidden state after n_loops)
           ▼
      [Coda]  coda_layers × TransformerBlock (dense SwiGLU), run ONCE
           │
@@ -44,12 +44,14 @@ on the relevant methods:
   token is fed through the model, so the correct RoPE positions must be selected
   by slicing the phasor table at ``[start_pos : start_pos + T]``. Without this,
   cached tokens would receive position-0 rotations and generation would degrade.
-* **KV-cache ⊗ ACT short-circuit conflict.** With a KV cache present, every loop
-  depth of the recurrent block must execute on every forward pass so that later
-  decode steps find populated keys at every ``recurrent_loop_{t}`` cache key. The
-  early-exit ``if halted.all(): break`` optimisation is only valid when
-  ``kv_cache is None``. This same invariant is the crux of continuous depth-wise
-  batching (see :meth:`Ouroboros.generate_depthwise_batched`).
+* **Depth-wise batching ⊗ KV cache.** The core recurrent loop runs a fixed
+  ``n_loops`` on every forward pass, so a KV cache is always populated at every
+  ``recurrent_loop_{t}`` key — the standard ``generate`` path has no early-exit
+  subtlety. Continuous depth-wise batching layers a per-sequence,
+  convergence-based early exit on top (a sequence stops looping once its hidden
+  state stops changing), so a sequence can stop at a depth below ``n_loops``; the
+  cache for the depths it skipped must be handled so later decode steps stay
+  correct (see :meth:`Ouroboros.generate_depthwise_batched`).
 """
 
 from __future__ import annotations
@@ -82,7 +84,6 @@ class Ouroboros(nn.Module):
     Key properties:
 
     * **Same weights, more loops → deeper computation**, no parameter growth.
-    * **ACT halting** gives per-position variable compute inside a single batch.
     * **LTI-constrained injection** guarantees ``ρ(A) < 1`` by construction, so
       the loop is contractive and trains stably at high learning rates.
     * **Fine-grained MoE** (routed + shared experts) inside the recurrent block;
@@ -132,7 +133,7 @@ class Ouroboros(nn.Module):
         Args:
             cfg: Fully-populated :class:`OuroborosConfig` defining every
                 architectural hyperparameter (dims, heads, attention type, MoE
-                widths, recurrence/halting settings, RoPE base, init std).
+                widths, recurrence settings, RoPE base, init std).
         """
         super().__init__()
         raise NotImplementedError
@@ -214,9 +215,9 @@ class Ouroboros(nn.Module):
                 to extrapolate depth.
             kv_cache: Optional dict mutated in place for autoregressive decoding.
                 Pass an empty ``{}`` on the first step and reuse it across steps.
-                When non-``None``, every recurrent loop depth runs on every call
-                (no ACT early exit) so all ``recurrent_loop_{t}`` keys stay
-                populated for later decode steps.
+                The recurrent block runs its full fixed ``n_loops`` on every call,
+                so all ``recurrent_loop_{t}`` keys stay populated for later decode
+                steps.
             start_pos: Absolute index of the first token of ``input_ids`` within
                 the full sequence. ``0`` for prefill; ``prompt_len + step - 1``
                 for each subsequent single-token decode step. Selects the RoPE
@@ -247,8 +248,8 @@ class Ouroboros(nn.Module):
         the last generated token is fed through with
         ``start_pos = prompt_len + step - 1``, so per-step cost is one token's
         worth of attention against the growing cache rather than the whole
-        sequence. Because a cache is present, the recurrent block runs every loop
-        depth on every step (no ACT early exit) to keep all cache keys populated.
+        sequence. The recurrent block runs its full fixed ``n_loops`` on every
+        step, keeping all ``recurrent_loop_{t}`` cache keys populated.
 
         Sampling: the final-position logits are divided by ``temperature``,
         optionally restricted to the ``top_k`` highest logits (the rest masked to
@@ -279,38 +280,43 @@ class Ouroboros(nn.Module):
         input_ids: torch.Tensor,
         max_new_tokens: int = 64,
         max_loops: Optional[int] = None,
+        convergence_tol: float = 1e-3,
         temperature: float = 1.0,
         top_k: int = 50,
     ) -> torch.Tensor:
         """Generate with continuous depth-wise batching (Phase-7 differentiator).
 
         Because every sequence shares the same recurrent block, sequences in one
-        batch can **exit the loop at different ACT-driven depths**: easy
-        sequences halt early, hard ones loop deeper, all within a single batched
-        decode step — instead of every sequence paying the worst-case
-        ``max_loops`` depth. Throughput therefore tracks the ACT halting-depth
-        distribution; the literature suggests a ~2–3× ceiling and the measured
-        number fills resume bullet 3.
+        batch can **exit the loop at different convergence-driven depths**: a
+        sequence stops looping once its hidden state stops changing between
+        iterations (``‖h_{t+1} − h_t‖`` falls below ``convergence_tol``), while
+        sequences still being refined keep looping — all within a single batched
+        decode step, instead of every sequence paying the worst-case ``max_loops``
+        depth. This is a non-learned early-exit criterion (no halting head): easy
+        sequences converge fast and exit early, hard ones loop deeper. Throughput
+        therefore tracks the convergence-depth distribution; the literature
+        suggests a ~2–3× ceiling and the measured number fills resume bullet 3.
 
         **The cache-key population challenge.** With a KV cache, a sequence that
-        exits the loop at depth ``d`` leaves cache keys ``recurrent_loop_{d..n}``
-        unpopulated for its rows. A *later* decode step for that same sequence
-        that loops deeper than ``d`` would then read missing keys — a silent
-        correctness bug. Candidate resolutions (to be benchmarked and discussed
-        in ``docs/ARCHITECTURE.md`` and ``docs/DESIGN_DECISIONS.md``):
+        converges and exits at depth ``d`` leaves cache keys
+        ``recurrent_loop_{d..n}`` unpopulated for its rows. A *later* decode step
+        for that same sequence that loops deeper than ``d`` would then read
+        missing keys — a silent correctness bug. Candidate resolutions (to be
+        benchmarked and discussed in ``docs/ARCHITECTURE.md`` and
+        ``docs/DESIGN_DECISIONS.md``):
 
         * **(a) Run-to-max-active-depth + mask.** Every step, loop to the deepest
           depth still active for *any* sequence in the batch and mask the rows
-          that have already halted so they neither update nor contribute. This
+          that have already converged so they neither update nor contribute. This
           keeps a single dense, rectangular cache and guarantees every reachable
           ``recurrent_loop_{t}`` key is populated for every row. Simple and
           correct; the savings come from the batch's *max* depth being below
           ``max_loops``, not from per-row ragged depth.
         * **(b) Per-sequence depth + ragged/compacted cache.** Track each
           sequence's depth and keep a ragged (or periodically compacted) cache so
-          halted rows store nothing beyond their exit depth. Maximal memory
+          exited rows store nothing beyond their exit depth. Maximal memory
           savings but the most bookkeeping and the trickiest correctness story.
-        * **(c) Depth bucketing.** Sort/bucket sequences by predicted halting
+        * **(c) Depth bucketing.** Sort/bucket sequences by predicted convergence
           depth so each micro-batch shares a depth, then process buckets
           independently. Amortises the masking overhead of (a) when the depth
           distribution is multi-modal.
@@ -319,7 +325,7 @@ class Ouroboros(nn.Module):
         only option whose cache stays dense and rectangular (so the existing
         ``recurrent_loop_{t}`` keying and the standard KV-cache path are reused
         verbatim), it is straightforwardly correct, and it already captures the
-        headline win whenever the batch's deepest active sequence halts before
+        headline win whenever the batch's deepest active sequence converges before
         ``max_loops``. Options (b)/(c) are documented as future optimisations to
         squeeze further memory/throughput once (a) is validated and benchmarked.
 
@@ -327,8 +333,12 @@ class Ouroboros(nn.Module):
             input_ids: Prompt token indices of shape ``(B, T)``.
             max_new_tokens: Number of new tokens to append.
             max_loops: Hard cap on recurrent depth per step; ``None`` falls back
-                to ``cfg.max_loop_iters``. ACT may halt individual sequences
-                before this cap.
+                to ``cfg.max_loop_iters``. Individual sequences may converge and
+                exit before this cap.
+            convergence_tol: Early-exit threshold on the per-sequence hidden-state
+                change ``‖h_{t+1} − h_t‖`` between loop iterations; a sequence
+                stops looping once its change falls below this value. Larger
+                values exit sooner (more speed, coarser refinement).
             temperature: Softmax temperature for sampling.
             top_k: Keep only the ``top_k`` highest-probability logits before
                 sampling; ``0`` disables top-k filtering.
