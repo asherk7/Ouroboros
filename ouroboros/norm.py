@@ -3,8 +3,8 @@
 Ouroboros uses RMSNorm (Zhang & Sennrich, 2019) in place of LayerNorm everywhere
 a normalization is needed: inside every :class:`~ouroboros.block.TransformerBlock`
 (pre-norm on the attention and FFN sublayers), on the combined hidden state inside
-the recurrent loop, on the MLA Q/KV latents, and as the final norm before the LM
-head. RMSNorm drops the mean-subtraction and bias of LayerNorm, keeping only a
+the recurrent loop, and as the final norm before the LM head. RMSNorm drops the
+mean-subtraction and bias of LayerNorm, keeping only a
 learned per-channel rescaling, which is cheaper and empirically just as stable for
 transformer training.
 """

@@ -10,9 +10,9 @@ use these exact names.
 
 Ouroboros is an independent, from-scratch implementation inspired by the
 recurrent-depth transformer literature (Universal Transformers, Parcae,
-DeepSeek-V2 / DeepSeekMoE / DeepSeek-V3). It is a Prelude / Recurrent / Coda
-design with fine-grained MoE (routed + shared experts), switchable MLA/GQA
-attention, and LTI-constrained stable injection.
+DeepSeekMoE / DeepSeek-V3). It is a Prelude / Recurrent / Coda design with
+fine-grained MoE (routed + shared experts), GQA attention, and LTI-constrained
+stable injection.
 
 Sizing notes (encode these as guidance, not as logic):
 
@@ -29,9 +29,9 @@ Sizing notes (encode these as guidance, not as logic):
   coda blocks uses width ``dim * 4 // 3`` (a deliberate parameter-budget choice,
   smaller than the common ``8/3 * dim`` SwiGLU sizing).
 * **Tiny test config:** a "tiny" smoke-test configuration overrides the defaults
-  with e.g. ``dim=64, n_heads=4, n_kv_heads=1, n_experts=4, prelude_layers=1,
-  coda_layers=1, max_loop_iters=2`` to keep CPU unit tests fast. It is described
-  in the docs and constructed at call sites — it is **not** hardcoded here.
+  with e.g. ``dim=64, n_heads=4, n_kv_heads=2, n_experts=4, prelude_layers=1,
+  coda_layers=1, max_loop_iters=4`` to keep CPU unit tests fast. It is built by
+  the ``tiny_config`` helper in the test suite — it is **not** hardcoded here.
 * **T4 training config:** the realistic single-GPU training target is a small
   model of roughly **10-30M parameters** trained on WikiText-103 or a FineWeb-Edu
   slice. At small ``dim`` the (tied) embedding table can dominate the parameter
@@ -48,9 +48,10 @@ class OuroborosConfig:
     """Architecture and training hyperparameters for :class:`~ouroboros.model.Ouroboros`.
 
     The defaults below define a small, T4-friendly research model. Fields are
-    grouped by subsystem (core, attention, MoE FFN, recurrence, load
-    balancing, RoPE/norm/init/regularization). MLA-only fields are ignored when
-    ``attn_type == "gqa"`` and vice versa.
+    grouped by subsystem (core, MoE FFN, recurrence, load balancing,
+    RoPE/norm/init/regularization). Cross-field invariants are validated in
+    :meth:`__post_init__`, so an invalid combination fails at construction with
+    a clear message rather than as a shape error deep in a forward pass.
     """
 
     # --- Core ---
@@ -58,20 +59,11 @@ class OuroborosConfig:
     vocab_size: int = 8192
     dim: int = 512  # residual-stream width
     n_heads: int = 8  # query heads
-    # GQA key/value heads (n_heads % n_kv_heads == 0); ignored by MLA
-    n_kv_heads: int = 2
+    n_kv_heads: int = 2  # GQA key/value heads (n_heads % n_kv_heads == 0)
     max_seq_len: int = 1024  # RoPE precomputation length
     max_loop_iters: int = 8  # default recurrent depth T at inference
     prelude_layers: int = 2  # standard blocks before the loop
     coda_layers: int = 2  # standard blocks after the loop
-
-    # --- Attention ("gqa" | "mla") ---
-    attn_type: str = "gqa"  # default GQA: simpler + has the FA2 fast path
-    kv_lora_rank: int = 128  # [MLA] compressed KV latent cached
-    q_lora_rank: int = 256  # [MLA] compressed Q latent
-    qk_rope_head_dim: int = 32  # [MLA] per-head dims that receive RoPE
-    qk_nope_head_dim: int = 64  # [MLA] per-head dims without RoPE
-    v_head_dim: int = 64  # [MLA] per-head value dim
 
     # --- MoE FFN (used only inside the Recurrent Block) ---
     n_experts: int = 8  # routed experts
@@ -82,6 +74,10 @@ class OuroborosConfig:
     # --- Recurrence ---
     # channels receiving loop-index embedding; None -> dim // 8
     loop_index_dim: Optional[int] = None
+    # LTI-constrained injection (the stability mechanism). False replaces the
+    # LTI update with a naive residual injection ``h = transformer_out + e`` —
+    # the ablation arm of the stability experiment (EXPERIMENTS.md, exp 1).
+    use_lti: bool = True
 
     # --- Load balancing (Ouroboros completes what reference impls leave as a stub) ---
     # aux-loss-free LB: per-step bias nudge magnitude
@@ -94,3 +90,34 @@ class OuroborosConfig:
     init_std: float = 0.02  # N(0, init_std) weight init
     dropout: float = 0.0  # 0.0 disables; 0.1 typical for pretraining
     max_output_tokens: int = 1024  # generation cap
+
+    def __post_init__(self) -> None:
+        """Validate cross-field invariants; raise ``ValueError`` on violation."""
+        if self.dim % self.n_heads != 0:
+            raise ValueError(
+                f"dim ({self.dim}) must be divisible by n_heads ({self.n_heads})"
+            )
+        head_dim = self.dim // self.n_heads
+        if head_dim % 2 != 0:
+            raise ValueError(
+                f"head_dim = dim // n_heads = {head_dim} must be even "
+                "(RoPE rotates adjacent channel pairs)"
+            )
+        if self.n_heads % self.n_kv_heads != 0:
+            raise ValueError(
+                f"n_heads ({self.n_heads}) must be divisible by "
+                f"n_kv_heads ({self.n_kv_heads}) for GQA grouping"
+            )
+        if self.n_experts_per_tok > self.n_experts:
+            raise ValueError(
+                f"n_experts_per_tok ({self.n_experts_per_tok}) cannot exceed "
+                f"n_experts ({self.n_experts})"
+            )
+        loop_dim = (
+            self.loop_index_dim if self.loop_index_dim is not None else self.dim // 8
+        )
+        if loop_dim % 2 != 0 or not 0 < loop_dim <= self.dim:
+            raise ValueError(
+                f"loop_index_dim (resolved to {loop_dim}) must be even and in "
+                f"(0, dim={self.dim}] — it is consumed as sin/cos pairs"
+            )

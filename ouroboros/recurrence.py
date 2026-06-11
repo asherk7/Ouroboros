@@ -8,7 +8,7 @@ ARCHITECTURE.md / the canonical data-flow diagram):
 
     h_loop   = loop_index_embedding(h, t, loop_dim)      # depth signal
     combined = RMSNorm(h_loop + e)                        # re-inject input
-    trans    = TransformerBlock(combined, ...)            # MLA/GQA + MoE
+    trans    = TransformerBlock(combined, ...)            # GQA + MoE
     h        = LTIInjection(h, e, trans)                  # h = A·h + B·e + trans
 
 The loop runs a fixed number of iterations (``n_loops``) and returns the final
@@ -17,11 +17,11 @@ same number of loops.
 
 Public API (exact signatures are the contract):
     - ``loop_index_embedding`` — sinusoidal depth signal over the first
-      ``loop_dim`` channels (component 9).
+      ``loop_dim`` channels (component 8).
     - ``LTIInjection`` — LTI-constrained stable input injection guaranteeing
-      ``ρ(A) < 1`` by construction (component 10).
+      ``ρ(A) < 1`` by construction (component 9).
     - ``RecurrentBlock`` — the looped core that owns the above and runs the
-      fixed-depth loop body (component 11).
+      fixed-depth loop body (component 10).
 
 This is an *independent implementation inspired by the recurrent-depth
 transformer literature* — Parcae (Prairie et al., 2026) for the LTI injection
@@ -51,7 +51,7 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
-# (9) Loop-index embedding — sinusoidal signal over recurrence DEPTH
+# (8) Loop-index embedding — sinusoidal signal over recurrence DEPTH
 # ---------------------------------------------------------------------------
 
 
@@ -104,7 +104,7 @@ def loop_index_embedding(
 
 
 # ---------------------------------------------------------------------------
-# (10) LTIInjection — LTI-constrained stable input injection (ρ(A) < 1)
+# (9) LTIInjection — LTI-constrained stable input injection (ρ(A) < 1)
 # ---------------------------------------------------------------------------
 
 
@@ -218,7 +218,7 @@ class LTIInjection(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# (11) RecurrentBlock — the looped core (fixed-depth loop body)
+# (10) RecurrentBlock — the looped core (fixed-depth loop body)
 # ---------------------------------------------------------------------------
 
 
@@ -233,7 +233,7 @@ class RecurrentBlock(nn.Module):
 
     Owned submodules / fields:
         - ``block``     = ``TransformerBlock(cfg, use_moe=True)`` (shared weights).
-        - ``injection`` = ``LTIInjection(dim)``.
+        - ``injection`` = ``LTIInjection(dim)`` if ``cfg.use_lti`` else ``None``.
         - ``norm``      = ``RMSNorm(dim)`` applied to ``h_loop + e``.
         - ``loop_dim``  = ``loop_index_dim`` if set else ``dim // 8`` — the number
           of channels that receive the loop-index embedding.
@@ -244,7 +244,12 @@ class RecurrentBlock(nn.Module):
         3. ``trans   = block(combined, freqs_cis, mask, kv_cache,
            cache_key=f"recurrent_loop_{t}")`` — each depth uses a DISTINCT cache
            key so loop caches never collide.
-        4. ``h       = injection(h, e, trans)``  — LTI update.
+        4. ``h       = injection(h, e, trans)``  — LTI update. When
+           ``cfg.use_lti`` is ``False`` (the stability-ablation arm,
+           EXPERIMENTS.md exp 1), this step is instead the naive residual
+           injection ``h = trans + e`` — no ``A``/``B`` parameters and no
+           spectral-radius guarantee, which is exactly what the ablation
+           measures.
 
     After ``n_loops`` iterations the final hidden state ``h`` is returned. Because
     the loop always runs every depth, a KV cache is populated at every
@@ -263,9 +268,11 @@ class RecurrentBlock(nn.Module):
         """Initialize the recurrent block and its injection machinery.
 
         Args:
-            cfg: ``OuroborosConfig``. Uses ``dim``, ``max_loop_iters``, and
+            cfg: ``OuroborosConfig``. Uses ``dim``, ``max_loop_iters``,
                 ``loop_index_dim`` (falling back to ``dim // 8`` when
-                ``loop_index_dim`` is ``None``).
+                ``loop_index_dim`` is ``None``), and ``use_lti`` (``False``
+                builds no ``LTIInjection`` and uses the naive residual update —
+                the ablation arm).
         """
         super().__init__()
         raise NotImplementedError
@@ -286,7 +293,10 @@ class RecurrentBlock(nn.Module):
         call, so all ``recurrent_loop_{t}`` cache keys stay populated.
 
         Args:
-            h: Initial hidden state from the Prelude, shape ``(B, T, dim)``.
+            h: Initial hidden state ``h_0``, shape ``(B, T, dim)``. The model
+                passes the Prelude output here — i.e. ``h_0 = e``; the two
+                arguments start as the same tensor and diverge as ``h`` is
+                updated across iterations.
             e: Frozen encoded input re-injected at every step, shape
                 ``(B, T, dim)``.
             freqs_cis: Precomputed RoPE frequencies for the active attention type,

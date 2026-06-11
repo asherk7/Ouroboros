@@ -8,7 +8,7 @@ the continuous depth-wise batched :meth:`Ouroboros.generate_depthwise_batched`
 
 Ouroboros is an independent, from-scratch implementation inspired by the
 recurrent-depth transformer literature (Universal Transformers, Parcae,
-DeepSeek-V2 / DeepSeekMoE / DeepSeek-V3, Relaxed Recursive Transformers). The
+DeepSeekMoE / DeepSeek-V3, Relaxed Recursive Transformers). The
 forward pass is a **Prelude / Recurrent / Coda** design::
 
      input_ids (B, T)
@@ -21,8 +21,9 @@ forward pass is a **Prelude / Recurrent / Coda** design::
           │
           ├──────────────► e := x   (encoded input; FROZEN, re-injected each loop)
           ▼
-     [Recurrent Block]  one TransformerBlock (MoE) looped n_loops times,
-                        h_{t+1} = A·h_t + B·e + Transformer(h_t, e), ρ(A) < 1
+     [Recurrent Block]  one TransformerBlock (GQA + MoE) looped n_loops times,
+                        h_0 = e;  h_{t+1} = A·h_t + B·e + Transformer(h_t, e),
+                        ρ(A) < 1
           │  x := h (final hidden state after n_loops)
           ▼
      [Coda]  coda_layers × TransformerBlock (dense SwiGLU), run ONCE
@@ -33,13 +34,9 @@ forward pass is a **Prelude / Recurrent / Coda** design::
           ▼
      logits (B, T, vocab_size)
 
-Three subtleties dominate the design of this module and are documented in detail
+Two subtleties dominate the design of this module and are documented in detail
 on the relevant methods:
 
-* **Dual RoPE buffers.** GQA rotates the full ``dim // n_heads`` per-head width,
-  while MLA rotates only the decoupled ``qk_rope_head_dim``. The model therefore
-  precomputes **two** phasor tables — ``freqs_cis`` (GQA) and ``freqs_cis_mla``
-  (MLA) — and selects between them at forward time according to ``attn_type``.
 * **``start_pos`` decode slicing.** During incremental decoding only the newest
   token is fed through the model, so the correct RoPE positions must be selected
   by slicing the phasor table at ``[start_pos : start_pos + T]``. Without this,
@@ -88,17 +85,13 @@ class Ouroboros(nn.Module):
       the loop is contractive and trains stably at high learning rates.
     * **Fine-grained MoE** (routed + shared experts) inside the recurrent block;
       dense SwiGLU FFNs in the prelude and coda.
-    * **Switchable attention** — GQA (default; has an FA2 / SDPA-flash fast path)
-      or MLA (compressed KV cache) — selected via ``cfg.attn_type``.
+    * **GQA attention** with an FA2 / SDPA-flash fast path and manual fallback.
 
     Submodules (built in :meth:`__init__`):
 
     * ``embed`` — ``nn.Embedding(vocab_size, dim)``; its weight is **tied** to the
       LM head so the two share storage.
-    * ``freqs_cis`` — registered buffer, RoPE phasors sized ``dim // n_heads``
-      (used when ``attn_type == "gqa"``).
-    * ``freqs_cis_mla`` — registered buffer, RoPE phasors sized
-      ``qk_rope_head_dim`` (used when ``attn_type == "mla"``).
+    * ``freqs_cis`` — registered buffer, RoPE phasors sized ``dim // n_heads``.
     * ``prelude`` — ``nn.ModuleList`` of ``prelude_layers`` dense
       :class:`~ouroboros.block.TransformerBlock` (``use_moe=False``), run once.
     * ``recurrent`` — a single :class:`~ouroboros.recurrence.RecurrentBlock`.
@@ -112,18 +105,13 @@ class Ouroboros(nn.Module):
     def __init__(self, cfg: OuroborosConfig) -> None:
         """Build the model and tie the LM-head weight to the embedding.
 
-        Constructs the embedding, both RoPE buffers, the prelude/recurrent/coda
+        Constructs the embedding, the RoPE buffer, the prelude/recurrent/coda
         stacks, the final norm, and the tied LM head, then runs
         :meth:`_init_weights`.
 
-        Two RoPE buffers are precomputed so that whichever attention type is
-        active has correctly-sized phasors available without re-allocation:
-
-        * ``freqs_cis`` via ``precompute_rope_freqs(dim // n_heads, max_seq_len,
-          rope_theta)`` — the full per-head width rotated by GQA.
-        * ``freqs_cis_mla`` via ``precompute_rope_freqs(qk_rope_head_dim,
-          max_seq_len, rope_theta)`` — only the decoupled RoPE sub-dimension
-          rotated by MLA's RoPE keys/queries.
+        The RoPE buffer is precomputed once: ``freqs_cis`` via
+        ``precompute_rope_freqs(dim // n_heads, max_seq_len, rope_theta)`` —
+        the per-head width rotated by GQA.
 
         Weight tying sets ``self.head.weight = self.embed.weight`` so the
         ``vocab_size × dim`` table is shared; at the small T4 scale this tied
@@ -132,8 +120,8 @@ class Ouroboros(nn.Module):
 
         Args:
             cfg: Fully-populated :class:`OuroborosConfig` defining every
-                architectural hyperparameter (dims, heads, attention type, MoE
-                widths, recurrence settings, RoPE base, init std).
+                architectural hyperparameter (dims, heads, MoE widths,
+                recurrence settings, RoPE base, init std).
         """
         super().__init__()
         raise NotImplementedError
@@ -145,13 +133,14 @@ class Ouroboros(nn.Module):
         the model (the tied head/embedding table is initialized once via the
         shared parameter).
 
-        Init improvement note (documented, not yet implemented): naive
-        ``N(0, init_std)`` on all weights ignores residual-depth scaling. A
-        looped model accumulates variance across loop iterations, so GPT-2-style
-        ``1 / sqrt(2 * n_eff)`` scaling on the residual output projections (and
-        optionally QK-norm or a logit z-loss) is worth ablating as a stability
-        improvement; ``n_eff`` here counts the effective residual depth including
-        the loop count.
+        TODO (Phase 5 — treat as a known stability gap, not optional polish):
+        naive ``N(0, init_std)`` on all weights ignores residual-depth scaling.
+        A looped model accumulates variance across loop iterations, so at
+        ``max_loop_iters=8`` this is a plausible source of early-training
+        instability. Apply GPT-2-style ``1 / sqrt(2 * n_eff)`` scaling on the
+        residual output projections (``n_eff`` = effective residual depth
+        including the loop count), and ablate QK-norm / a logit z-loss if
+        instability persists.
         """
         raise NotImplementedError
 
@@ -194,17 +183,18 @@ class Ouroboros(nn.Module):
         Steps:
 
         1. Embed ``input_ids`` to ``x`` of shape ``(B, T, dim)``.
-        2. Select the RoPE buffer by ``cfg.attn_type`` (``freqs_cis_mla`` for
-           ``"mla"`` else ``freqs_cis``) and **slice it to
-           ``[start_pos : start_pos + T]``** so each token gets its true
-           absolute position's phasors (critical for cached decode).
+        2. **Slice the RoPE buffer to ``freqs_cis[start_pos : start_pos + T]``**
+           so each token gets its true absolute position's phasors (critical
+           for cached decode).
         3. Build a causal mask only when ``T > 1`` (a single-token decode step
            needs no mask); pass ``None`` otherwise.
         4. Run the prelude blocks with cache keys ``f"prelude_{i}"``.
         5. **Freeze** ``e = x`` — the encoded input re-injected at every loop
            iteration to keep the original signal alive across arbitrary depth.
-        6. Run the recurrent block (it owns the ``f"recurrent_loop_{t}"`` cache
-           keys internally).
+        6. Run the recurrent block as ``recurrent(h=e, e=e, ...)`` — the prelude
+           output seeds **both** the initial hidden state (``h_0 = e``) and the
+           frozen injection input. The block owns the ``f"recurrent_loop_{t}"``
+           cache keys internally.
         7. Run the coda blocks with cache keys ``f"coda_{i}"``.
         8. Return ``head(norm(x))``.
 
@@ -219,10 +209,12 @@ class Ouroboros(nn.Module):
                 so all ``recurrent_loop_{t}`` keys stay populated for later decode
                 steps.
             start_pos: Absolute index of the first token of ``input_ids`` within
-                the full sequence. ``0`` for prefill; ``prompt_len + step - 1``
-                for each subsequent single-token decode step. Selects the RoPE
-                slice — omitting it makes decoded tokens use position-0 rotations
-                and degrades generation.
+                the full sequence — equivalently, the number of tokens already in
+                the KV cache. ``0`` for prefill. When decoding the *k*-th new
+                token (``k = 1, 2, ...``), the single token fed in sits at
+                absolute position ``prompt_len + k - 1``, so pass exactly that.
+                Selects the RoPE slice — omitting it makes decoded tokens use
+                position-0 rotations and degrades generation.
 
         Returns:
             Logits over the vocabulary of shape ``(B, T, vocab_size)``.
@@ -243,13 +235,14 @@ class Ouroboros(nn.Module):
     ) -> torch.Tensor:
         """Autoregressively generate tokens with a KV cache (top-k sampling).
 
-        Uses a single ``kv_cache`` dict reused across decode steps. On step 0 the
-        full prompt is processed with ``start_pos=0``; on every later step only
-        the last generated token is fed through with
-        ``start_pos = prompt_len + step - 1``, so per-step cost is one token's
-        worth of attention against the growing cache rather than the whole
-        sequence. The recurrent block runs its full fixed ``n_loops`` on every
-        step, keeping all ``recurrent_loop_{t}`` cache keys populated.
+        Uses a single ``kv_cache`` dict reused across decode steps. First the
+        full prompt is prefilled with ``start_pos=0``; then, for the *k*-th
+        generated token (``k = 1..max_new_tokens``), only the previously sampled
+        token is fed through with ``start_pos = prompt_len + k - 1`` (its
+        absolute position — equal to the current cache length), so per-step cost
+        is one token's worth of attention against the growing cache rather than
+        the whole sequence. The recurrent block runs its full fixed ``n_loops``
+        on every step, keeping all ``recurrent_loop_{t}`` cache keys populated.
 
         Sampling: the final-position logits are divided by ``temperature``,
         optionally restricted to the ``top_k`` highest logits (the rest masked to
@@ -289,13 +282,24 @@ class Ouroboros(nn.Module):
         Because every sequence shares the same recurrent block, sequences in one
         batch can **exit the loop at different convergence-driven depths**: a
         sequence stops looping once its hidden state stops changing between
-        iterations (``‖h_{t+1} − h_t‖`` falls below ``convergence_tol``), while
-        sequences still being refined keep looping — all within a single batched
-        decode step, instead of every sequence paying the worst-case ``max_loops``
-        depth. This is a non-learned early-exit criterion (no halting head): easy
-        sequences converge fast and exit early, hard ones loop deeper. Throughput
-        therefore tracks the convergence-depth distribution; the literature
-        suggests a ~2–3× ceiling and the measured number fills resume bullet 3.
+        iterations, while sequences still being refined keep looping — all within
+        a single batched decode step, instead of every sequence paying the
+        worst-case ``max_loops`` depth. This is a non-learned early-exit
+        criterion (no halting head): easy sequences converge fast and exit early,
+        hard ones loop deeper. Throughput therefore tracks the convergence-depth
+        distribution; the literature suggests a ~2–3× ceiling.
+
+        **Convergence test (exact definition).** A sequence ``b`` exits after
+        loop ``t`` once its per-sequence *relative* change falls below the
+        threshold::
+
+            ‖h_{t+1}[b] − h_t[b]‖_F / (‖h_t[b]‖_F + 1e-8)  <  convergence_tol
+
+        where the Frobenius norm is taken over that sequence's ``(T, dim)``
+        hidden block (``T = 1`` during decode). The relative form is scale-free —
+        a raw L2 norm would grow with ``sqrt(T · dim)`` and make any fixed
+        default meaningless — so the ``1e-3`` default is a meaningful "0.1%
+        change per iteration" criterion at every model size.
 
         **The cache-key population challenge.** With a KV cache, a sequence that
         converges and exits at depth ``d`` leaves cache keys
@@ -335,9 +339,10 @@ class Ouroboros(nn.Module):
             max_loops: Hard cap on recurrent depth per step; ``None`` falls back
                 to ``cfg.max_loop_iters``. Individual sequences may converge and
                 exit before this cap.
-            convergence_tol: Early-exit threshold on the per-sequence hidden-state
-                change ``‖h_{t+1} − h_t‖`` between loop iterations; a sequence
-                stops looping once its change falls below this value. Larger
+            convergence_tol: Early-exit threshold on the per-sequence **relative**
+                hidden-state change between loop iterations (see the convergence
+                test definition above); a sequence stops looping once
+                ``‖Δh‖_F / (‖h‖_F + 1e-8)`` falls below this value. Larger
                 values exit sooner (more speed, coarser refinement).
             temperature: Softmax temperature for sampling.
             top_k: Keep only the ``top_k`` highest-probability logits before

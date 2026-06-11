@@ -10,22 +10,22 @@ was made, so the design can be defended end-to-end.
 There are two distinct defensibility standards at play, and each decision below is
 written against the one that applies to it:
 
-- **Adopted components** (LTI injection, MLA/GQA, MoE, SwiGLU, aux-loss-free
+- **Adopted components** (LTI injection, GQA, MoE, SwiGLU, aux-loss-free
   balancing) are defended on *depth of understanding*. For each
   I state: what problem it solves, the concrete alternative, why this choice is
   better here, and what I would change with more time or compute. The bar is being
   able to answer "why this and not that?" without hand-waving.
 - **Novel / engineering-completion components** (the aux-loss-free bias *update
-  step* that reference implementations leave stubbed, INT8 post-training
-  quantization, and continuous depth-wise batching) are defended on *documented
-  reasoning plus measured tradeoffs*. The bar is a written rationale today and a
-  number from an `EXPERIMENTS.md` run later.
+  step* that reference implementations leave stubbed, and continuous depth-wise
+  batching) are defended on *documented reasoning plus measured tradeoffs*. The
+  bar is a written rationale today and a number from an `EXPERIMENTS.md` run
+  later.
 
 Every decision carries an **Evidence** line. These are deliberate placeholders tied
 to a specific run in `EXPERIMENTS.md`, to be filled with real measurements during
 Phase 6 (training) and Phase 7 (inference optimization). An empty evidence line is a
 TODO, not a claim. The configuration field names used throughout (`dim`,
-`n_loops`, `attn_type`, `n_experts_per_tok`,
+`n_loops`, `use_lti`, `n_experts_per_tok`,
 `router_bias_update_rate`, etc.) are the exact fields declared in
 `ouroboros/config.py` (`OuroborosConfig`).
 
@@ -58,8 +58,9 @@ prelude/recurrent/coda split (the Parcae-style recurrent-depth design) lets the
 *non-shared* prelude lift tokens into a clean latent once, hands that latent to the
 shared recurrent core for the part that actually benefits from arbitrary depth, and
 uses a *non-shared* coda to read the converged latent out. Concretely, the
-prelude output `e` is frozen and re-injected at every loop step (`h = A·h + B·e +
-Transformer(h, e)`), which is only coherent if `e` lives in a stable encoded space
+prelude output `e` seeds the loop (`h_0 = e`) and is frozen and re-injected at
+every loop step (`h = A·h + B·e + Transformer(h, e)`), which is only coherent if
+`e` lives in a stable encoded space
 that the loop does not have to also produce — exactly what a dedicated prelude
 gives. It also keeps parameter count down (the loop is reused) while preserving the
 expressiveness that matters at the boundaries.
@@ -70,9 +71,9 @@ expressiveness that matters at the boundaries.
 coda should share an attention KV space with the recurrent block, and whether a
 second, shallower recurrent block (a two-scale loop) helps on reasoning-style data.
 
-**Evidence.** TBD — depth-extrapolation run (`EXPERIMENTS.md` §6, loop-count sweep):
+**Evidence.** TBD — depth-extrapolation run (`EXPERIMENTS.md` §2, loop-count sweep):
 expect a model trained at `n_loops=8` to retain or improve validation perplexity at
-`n_loops ∈ {4, 8, 16}`, which is only sensible if the recurrent core is isolated
+`n_loops ∈ {2, 4, 8, 16}`, which is only sensible if the recurrent core is isolated
 from encode/decode by the prelude/coda. A fully-looped baseline is expected to
 extrapolate worse.
 
@@ -85,7 +86,10 @@ constraint (`LTIInjection`): the per-channel diagonal state matrix `A` is built 
 that its spectral radius is **strictly < 1 by construction**, via a ZOH-style
 discretization computed in log space —
 `A = exp(-exp((log_dt + log_A).clamp(-20, 20)))`, giving every channel a value in
-`(0, 1)`. The update is `h_{t+1} = A·h_t + B·e + Transformer(h_t, e)`.
+`(0, 1)`. The update is `h_{t+1} = A·h_t + B·e + Transformer(h_t, e)`. The
+constraint is toggled by the `use_lti` config field (default `True`);
+`use_lti=False` swaps in the naive residual injection `h = transformer_out + e`
+used as the stability baseline.
 
 **Alternatives considered.**
 - *Gradient clipping* — clip the global grad norm and hope the recurrence does not
@@ -94,6 +98,9 @@ discretization computed in log space —
   iteration to bound its magnitude.
 - *Unconstrained learned `A`* — let `A` be a free parameter and rely on the
   optimizer to keep it contractive.
+- *Naive residual injection* — drop the state path entirely
+  (`h = transformer_out + e`): no `A`, no `B`, nothing to constrain. This is the
+  `use_lti=False` arm of the stability experiment.
 
 **Why this approach.** Across `T` loop iterations the hidden state evolves like a
 linear dynamical system `h_t ≈ A^t · h_0 + (injection terms)`. If `ρ(A) ≥ 1`, that
@@ -105,7 +112,11 @@ masks the instability rather than removing it. The LTI constraint removes the
 failure mode at the source — `ρ(A) < 1` is *guaranteed* regardless of what the
 optimizer does, because the exponential parameterization cannot produce a
 non-contractive `A`. That is what enables clean convergence at high learning rate
-with no clipping or normalization crutch (resume claim #2). The log-space clamp at
+with no clipping or normalization crutch (resume claim #2). Dropping the state
+path entirely (the naive residual injection) removes the explicit `A^t` term but
+leaves the loop with no contractive anchor at all — nothing damps depth-wise
+drift — which is why it serves as the honest experimental baseline rather than a
+competing stability mechanism. The log-space clamp at
 `(-20, 20)` is essential: it prevents the `0 · inf = NaN` that arises when `log_dt →
 -∞` and `log_A → +∞` under an aggressive step, keeping the whole thing fp32-robust.
 
@@ -117,9 +128,10 @@ collapse to a single timescale, and ablate whether learning `B` per-channel
 (current) versus a scalar materially changes injection strength.
 
 **Evidence.** TBD — stability run (`EXPERIMENTS.md` §1, LTI vs no-LTI): expect the
-unconstrained variant to diverge (`ρ(A) → ≥ 1`, loss → NaN) at `lr > 3e-4`, while
-the LTI variant converges cleanly across the LR sweep `{3e-4, 1e-3, 3e-3}`. `ρ(A)`
-is logged every step to W&B as the headline stability signal.
+`use_lti=False` arm (naive residual injection) to diverge (loss → NaN) at
+`lr > 3e-4`, while the LTI variant converges cleanly across the LR sweep
+`{3e-4, 1e-3, 3e-3}`. `ρ(A)` is logged every step to W&B as the headline stability
+signal for the LTI arm (the no-LTI arm has no state matrix to log).
 
 ---
 
@@ -146,60 +158,64 @@ that every loop iteration depends on. The shared expert (width `expert_dim *
 n_experts_per_tok`) always fires and absorbs common cross-domain structure, so the
 routed experts specialize rather than redundantly relearning syntax.
 
-**What I'd change with more time/compute.** Try MoE in the coda only (read-out may
+**What I'd change with more time/compute.** Run the matched-total-parameter
+MoE-vs-dense ablation that was trimmed from the experiment plan (sparsity should
+win at fixed total params; locally that claim currently rests on literature, not a
+measured number). Try MoE in the coda only (read-out may
 benefit from specialization) at matched FLOPs, and sweep `n_experts` /
 `n_experts_per_tok` against the fine-grained rule of thumb `expert_dim ≈ dim //
 (n_experts // n_experts_per_tok)`. With more compute I'd measure expert-utilization
 entropy across loop depth — do different experts dominate at different loop
 iterations, validating that the loop index genuinely changes routing behavior?
 
-**Evidence.** TBD — MoE-vs-dense run (`EXPERIMENTS.md` §3, matched parameter
-budget): expect sparse MoE in the recurrent block to match or beat a dense FFN of
-equal *total* parameters at lower activated FLOPs per token. Pair with the
-expert-routing diversity check (different tokens reach different experts).
+**Evidence.** TBD — MoE health is validated via the W&B training logs recorded on
+**every** run (`EXPERIMENTS.md` §0.6): the per-expert load variance (the spread of
+`expert_load`) staying low, the router bias visibly moving, and stable loss curves
+with MoE active in the loop. There is no dedicated MoE-vs-dense experiment in the
+trimmed three-experiment scope; the matched-budget ablation lives on the more-time
+list above.
 
 ---
 
-## 4. Switchable MLA / GQA rather than committing to one attention mechanism
+## 4. GQA only over switchable MLA/GQA attention (scope cut)
 
-**The decision.** Support both attention mechanisms behind a single
-`attn_type: str = "gqa"` config switch. `GQAttention` (default) shares
-`n_kv_heads` key/value heads across `n_heads` query heads; `MLAttention` caches a
-compressed KV latent `c_kv` of width `kv_lora_rank` plus a decoupled RoPE key. The
-`TransformerBlock` picks the class at construction; the model precomputes **two**
-RoPE buffers — `freqs_cis` sized `dim // n_heads` for GQA and `freqs_cis_mla` sized
-`qk_rope_head_dim` for MLA — and selects per `attn_type` at forward.
+**The decision.** `GQAttention` is the **only** attention mechanism: `n_kv_heads`
+key/value heads shared across `n_heads` query heads, one RoPE phasor table
+(`freqs_cis`, sized `dim // n_heads`), one KV-cache layout. An earlier revision
+planned MLA (DeepSeek-style compressed-KV latent attention) as a second mechanism
+behind a config switch, with its own config fields and a second RoPE buffer; that
+entire switch has been removed — class, config fields, dual buffers, and the
+MLA-vs-GQA experiment.
 
 **Alternatives considered.**
-- *GQA only* — simplest, has the `flash_attn_func` / SDPA-flash fast path, smaller
-  code surface.
-- *MLA only* — smallest KV cache (caches `c_kv` instead of full K/V), best decode
-  memory, but more moving parts and no clean flash fast path on T4.
+- *Switchable MLA/GQA* — the previous plan: both mechanisms behind one config flag,
+  ablated head-to-head.
+- *MLA only* — smallest KV cache (caches a low-rank latent instead of full per-head
+  K/V), best decode memory, but more moving parts and no clean flash fast path on T4.
 - *Full multi-head attention* — no KV sharing or compression; the most memory-hungry
   and the weakest baseline at this scale.
 
-**Why this approach.** These two mechanisms optimize different axes, and a portfolio
-project that backs resume claim #1 ("switchable MLA/GQA attention") should be able
-to *demonstrate* the tradeoff rather than assert it. GQA is the pragmatic default on
-a T4: it is simple, and it has a real fast path (`flash_attn_func` when present,
-otherwise `F.scaled_dot_product_attention` with the flash / mem-efficient backend).
-MLA shrinks the KV cache dramatically by caching a low-rank latent and reconstructing
-`k_nope`/`v` on the fly — the better choice when decode memory dominates. Making
-them switchable behind one config flag (and dual RoPE buffers) turns "which
-attention?" into a measured ablation instead of a guess, and keeps both code paths
-honest because both must pass the same shape/no-NaN/cache-correctness tests.
+**Why this approach.** A second attention mechanism doubles the attention, cache,
+RoPE, and test surface — two cache layouts, two phasor-table sizes, two sets of
+shape/no-NaN/cache-correctness tests — without adding anything to the core
+recurrence story (LTI-stable looped training, depth extrapolation, depth-wise
+batched inference). And MLA's compressed-KV payoff is a long-context, large-model
+story: at `max_seq_len=1024` and 10–30M parameters, GQA with `n_kv_heads=2` already
+makes the KV cache a non-problem, so the ablation would have measured a tradeoff
+this project does not need to win. GQA keeps the real fast path on the target
+hardware (`F.scaled_dot_product_attention` with the flash / mem-efficient backend,
+`flash_attn_func` when present). This is the same kind of deliberate scope cut as
+ACT (decision 5): keep the surface area that serves the resume claims, cut the rest.
 
-**What I'd change with more time/compute.** Implement the MLA "absorb" trick
-(folding `kv_up` into the query projection) so MLA never materializes full per-head
-K, closing most of its throughput gap with GQA. I'd also benchmark MLA's compressed
-cache at long context where its memory advantage is largest, and try a per-layer
-attention type (GQA in prelude/coda for speed, MLA in the recurrent block for cache
-size across loop depth).
+**What I'd change with more time/compute.** Reintroduce MLA only if the project
+moves to long context, where the compressed cache pays — implemented with the
+"absorb" trick from the start so it never materializes full per-head K, and
+benchmarked against GQA at the context lengths where the memory gap is material.
 
-**Evidence.** TBD — attention ablation (`EXPERIMENTS.md` §2, MLA vs GQA): same
-config; expect MLA cache bytes < GQA cache bytes (a correctness check on the
-compressed cache) with comparable perplexity, and GQA ahead on raw decode throughput
-on T4 owing to the flash fast path.
+**Evidence.** None owed — a scope cut, not a measured claim; no resume bullet
+references MLA. The GQA path is validated by the shape/no-NaN/cache-correctness
+tests and carries the decode numbers in the inference-throughput run
+(`EXPERIMENTS.md` §3).
 
 ---
 
@@ -230,8 +246,9 @@ core loop is trivial to reason about, the KV cache is always fully populated on 
 forward, and training is a clean `n_loops`-step unroll with no halting gradient to
 tune. The adaptive-compute *throughput* idea is not lost — it is recovered at
 inference, and more cheaply, by continuous depth-wise batching (decision 10), which
-exits a sequence once its hidden state stops changing
-(`‖h_{t+1} − h_t‖ < convergence_tol`) with no learned head. So Ouroboros keeps the
+exits a sequence once its hidden state stops changing (relative change
+`‖h_{t+1} − h_t‖_F / (‖h_t‖_F + 1e-8) < convergence_tol`) with no learned head. So
+Ouroboros keeps the
 win (variable depth per sequence at inference) while dropping the training-time
 complexity. This is a deliberate scope cut: the resume claims are LTI-stable looped
 training and the inference optimizations, not adaptive halting.
@@ -242,10 +259,10 @@ halt adaptively at test time) and compare its quality/throughput against the
 convergence-based early-exit. A ponder-cost-regularized ACT during training is the
 fuller version if the fixed depth proves wasteful on easy tokens.
 
-**Evidence.** TBD — loop-count sweep (`EXPERIMENTS.md` §6): expect a fixed-depth
+**Evidence.** TBD — loop-count sweep (`EXPERIMENTS.md` §2): expect a fixed-depth
 model trained at `n_loops=8` to converge stably and retain quality across
-`n_loops ∈ {4, 8, 16}` at inference (depth extrapolation), confirming a fixed loop
-count is sufficient at this scope.
+`n_loops ∈ {2, 4, 8, 16}` at inference (depth extrapolation), confirming a fixed
+loop count is sufficient at this scope.
 
 ---
 
@@ -280,7 +297,7 @@ loop embeddings buy before extrapolation breaks them. I'd also try injecting the
 index multiplicatively (RoPE-style rotation over depth) rather than additively.
 
 **Evidence.** TBD — loop-index ablation, folded into the depth-extrapolation run
-(`EXPERIMENTS.md` §6): expect sinusoidal loop-index to extrapolate to `n_loops=16`
+(`EXPERIMENTS.md` §2): expect sinusoidal loop-index to extrapolate to `n_loops=16`
 where a learned table (capped at the trained `max_loop_iters`) cannot, and a
 per-iteration check that the block's output genuinely differs across loops.
 
@@ -314,10 +331,11 @@ clean SwiGLU-vs-GELU comparison at matched parameters to put a number on the Swi
 gain at *this* scale (most published evidence is at larger scale). I'd also test
 GEGLU as a cheap alternative gate.
 
-**Evidence.** TBD — FFN-variant ablation (small add-on to `EXPERIMENTS.md` §3):
-expect SwiGLU to edge out GELU at matched parameters, and a documented perplexity
-cost (expected small) for the `4/3` vs `8/3` width choice. This is an adopted
-component, so the bar is reasoning + a confirming number, not novelty.
+**Evidence.** Deferred — no FFN-variant ablation survives the trimmed
+three-experiment scope. SwiGLU stands on literature strength (Shazeer 2020) and is
+exercised by every training run; the matched-parameter SwiGLU-vs-GELU and `4/3` vs
+`8/3` width comparisons live on the more-time list above. This is an adopted
+component, so the bar is reasoning, not novelty.
 
 ---
 
@@ -362,53 +380,51 @@ tradeoff. I'd also replace the O(topk · n_experts) masked-loop dispatch with a
 grouped/batched-gather dispatch (see the cross-cutting note below) since dispatch
 cost, not balancing, is the real bottleneck.
 
-**Evidence.** TBD — load-balancing run (`EXPERIMENTS.md` §3, MoE diagnostics):
-expect `update_router_bias()` to drive per-expert load toward uniform over training
-(measure the max/mean load ratio falling), where the never-updated baseline stays
-imbalanced. Defended on documented reasoning + this measured balance curve, per the
-novel-component bar.
+**Evidence.** TBD — load-balancing diagnostics logged on **every** training run
+(`EXPERIMENTS.md` §0.6): expect `update_router_bias()` to drive per-expert load
+toward uniform over training (the per-expert load variance falling, the bias
+visibly moving), where a never-updated bias stays imbalanced. There is no dedicated
+MoE experiment in the trimmed scope; this is validated from the training logs of
+the runs that exist. Defended on documented reasoning + this measured balance
+curve, per the novel-component bar.
 
 ---
 
-## 9. INT8 over FP16 / FP8 for inference quantization
+## 9. FP16 inference over INT8 quantization (scope cut)
 
-**The decision.** Use **post-training INT8** quantization for inference
-(`quantize_int8(model, method="dynamic")`, with a static/calibrated path via
-`calibrate`). Per-channel weight quantization is applied to the large Linear layers
-(attention projections, expert FFNs) while norms, the router, and the tied LM head
-stay in higher precision. Quantization error (perplexity delta) and throughput are
-measured with `quantization_error(fp_model, int8_model, eval_loader)`.
+**The decision.** Inference runs in the training precision, FP16. An earlier
+revision planned post-training INT8 weight quantization of the large Linear layers
+(dynamic and calibrated/static, with a third-party INT8 backend) as a headline
+inference optimization; that has been cut entirely — module, dependency, and the
+quantization experiment.
 
 **Alternatives considered.**
-- *Keep FP16* — the training/serving precision on T4; no quantization, no error, but
-  no INT8 throughput/memory win either.
-- *FP8* — newer low-precision format, but Turing (T4, sm75) has **no** FP8 tensor-core
-  support; FP8 only pays off on Hopper+.
-- *INT4* — smaller still, but materially larger accuracy loss and weaker, less
-  portable kernel support at this scale.
+- *Keep the INT8 plan* — per-channel weight PTQ on the big Linear layers, with
+  norms, the router, and the tied LM head left in higher precision (the previous
+  version of this decision).
+- *FP8 / INT4* — already rejected before the cut: Turing (T4, sm75) has no FP8
+  tensor-core path, and INT4 costs too much accuracy at this scale. Cutting INT8
+  makes them doubly moot.
 
-**Why this approach.** The target hardware decides this. The T4 has **INT8 tensor
-cores** (sm75) but no FP8 path, so INT8 is the precision that actually maps to
-hardware acceleration on the deployment target — choosing FP8 would be hardware
-fiction on a T4. INT8 PTQ on the big Linear layers cuts weight memory and lifts
-decode throughput while keeping the numerically sensitive pieces (norms, router,
-LM head) in higher precision to bound the perplexity hit. Post-training (not
-quantization-aware) keeps the scope realistic for a portfolio project: no retraining,
-just calibrate-and-measure. This is a *novel-component* decision (going beyond the
-reference literature for resume bullet #3), so it is defended by a written rationale
-now and a measured perplexity-vs-throughput tradeoff later.
+**Why this approach.** At 10–30M parameters the FP16 model is roughly **40 MB** —
+INT8 has no honest memory or latency story at this scale. Nothing meaningful is
+saved on a 16 GB card, and weight-only INT8 in pure PyTorch typically *slows*
+decode (per-step dequantization in unfused kernels) unless backed by fused INT8
+GEMMs that only pay off at much larger matrices. A quantization number measured
+here would be resume theater, not engineering. The inference story is instead
+carried entirely by mechanisms that do have an honest story at this scale:
+KV-cached decode, the SDPA flash / mem-efficient backend, and continuous
+depth-wise batching (decision 10) — with the headline [X]× defined as
+batched-convergence decode vs naive fixed-depth decode.
 
-**What I'd change with more time/compute.** Compare the realistic backends head-to-head
-on T4 (`torch.ao.quantization` dynamic vs static, and `bitsandbytes` Int8) on both
-perplexity delta and actual kernel throughput, since the win depends entirely on
-kernel quality. With more compute I'd add a per-layer sensitivity analysis (which
-layers tolerate INT8 and which must stay FP16) and explore INT8 *and* INT4 on the most
-tolerant layers (mixed-precision PTQ). Quantization-aware fine-tuning would be the next
-step if PTQ error proves too high.
+**What I'd change with more time/compute.** Revisit quantization only at a scale
+where it stops being fiction — when weight memory or memory bandwidth actually
+binds (hundreds of MB of weights, long-context serving) — and then with fused INT8
+kernels, measured end-to-end against the FP16 baseline.
 
-**Evidence.** TBD — quantization run (`EXPERIMENTS.md` §4): report perplexity before
-vs after INT8 (expect a small, acceptable delta) and the decode-throughput gain on T4.
-This number feeds resume bullet #3 (the inference-throughput multiplier).
+**Evidence.** None owed — a scope cut, not a measured claim. The
+inference-throughput claim now rests solely on the inference-throughput run
+(`EXPERIMENTS.md` §3); no quantization number is claimed anywhere.
 
 ---
 
@@ -417,9 +433,11 @@ This number feeds resume bullet #3 (the inference-throughput multiplier).
 **The decision.** Implement `generate_depthwise_batched` so that sequences in one
 batch may **exit the recurrent loop at different depths** via a non-learned
 *convergence* criterion: a sequence stops looping once its hidden state stops
-changing (`‖h_{t+1} − h_t‖ < convergence_tol`). Easy sequences converge early, hard
-ones loop more, in the *same* batch, instead of every sequence paying max depth. This
-is the headline inference optimization and the third resume bullet.
+changing (relative change `‖h_{t+1} − h_t‖_F / (‖h_t‖_F + 1e-8) < convergence_tol`).
+Easy sequences converge early, hard ones loop more, in the *same* batch, instead of
+every sequence paying max depth. With INT8 cut (decision 9), this carries the
+inference story alone: it is the headline inference optimization, and the third
+resume bullet's [X]× is batched-convergence decode vs naive fixed-depth decode.
 
 **Alternatives considered (for the cache-population problem this creates).** With a
 KV cache, a sequence that converges and exits at depth `d` leaves cache keys
@@ -457,7 +475,7 @@ cache invariant with a test that cached depth-wise-batched decode logits match a
 un-batched full-depth forward. I'd also sweep `convergence_tol` against the
 quality/throughput tradeoff.
 
-**Evidence.** TBD — depth-wise batching run (`EXPERIMENTS.md` §5): report throughput
+**Evidence.** TBD — inference-throughput run (`EXPERIMENTS.md` §3): report throughput
 with vs without convergence-based early-exit batching, tied to the convergence-depth
 distribution. Literature suggests ~2–3×; the *measured* number on T4 fills resume
 bullet #3. Defended on documented reasoning + this measured throughput gain, per the

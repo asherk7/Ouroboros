@@ -8,8 +8,7 @@ component is implemented. The phase numbers track the project roadmap:
 * Phase 1 — :class:`~ouroboros.norm.RMSNorm`, RoPE
   (:func:`~ouroboros.rope.precompute_rope_freqs`,
   :func:`~ouroboros.rope.apply_rope`).
-* Phase 2 — :class:`~ouroboros.attention.GQAttention`,
-  :class:`~ouroboros.attention.MLAttention`.
+* Phase 2 — :class:`~ouroboros.attention.GQAttention`.
 * Phase 3 — :class:`~ouroboros.moe.Expert`, :class:`~ouroboros.moe.MoEFFN`.
 * Phase 4 — :func:`~ouroboros.recurrence.loop_index_embedding`,
   :class:`~ouroboros.recurrence.LTIInjection`,
@@ -23,6 +22,8 @@ collection fails loudly even while every body is a skip.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 # These imports ARE part of the contract: collection fails loudly if any public
@@ -32,7 +33,6 @@ from ouroboros import (  # noqa: F401
     Expert,
     GQAttention,
     LTIInjection,
-    MLAttention,
     MoEFFN,
     OuroborosConfig,
     RecurrentBlock,
@@ -44,7 +44,7 @@ from ouroboros import (  # noqa: F401
 )
 
 
-def tiny_config(**overrides: object) -> OuroborosConfig:
+def tiny_config(**overrides: Any) -> OuroborosConfig:
     """Build a tiny, CPU-fast :class:`OuroborosConfig` for unit tests.
 
     Returns an :class:`OuroborosConfig` whose defaults are shrunk to keep every
@@ -53,9 +53,6 @@ def tiny_config(**overrides: object) -> OuroborosConfig:
 
     * ``dim=64`` with ``n_heads=4`` (``head_dim=16``, even — RoPE-safe) and
       ``n_kv_heads=2`` (``n_heads % n_kv_heads == 0`` — GQA-safe).
-    * MLA dims that stay self-consistent: ``qk_rope_head_dim=16`` (even),
-      ``qk_nope_head_dim=16``, ``v_head_dim=16``, ``kv_lora_rank=32``,
-      ``q_lora_rank=32``.
     * A small MoE: ``n_experts=4``, ``n_shared_experts=1``,
       ``n_experts_per_tok=2``, ``expert_dim=32``.
     * Shallow recurrence: ``prelude_layers=1``, ``coda_layers=1``,
@@ -63,12 +60,53 @@ def tiny_config(**overrides: object) -> OuroborosConfig:
 
     Args:
         **overrides: Field values that replace the tiny defaults (e.g.
-            ``attn_type="mla"`` to exercise the MLA path).
+            ``use_lti=False`` to exercise the naive-injection ablation arm).
 
     Returns:
         A tiny :class:`OuroborosConfig` suitable for fast unit tests.
     """
-    pytest.skip("stub — implement in Phase 1")
+    tiny: dict[str, Any] = dict(
+        dim=64,
+        n_heads=4,
+        n_kv_heads=2,
+        n_experts=4,
+        n_shared_experts=1,
+        n_experts_per_tok=2,
+        expert_dim=32,
+        prelude_layers=1,
+        coda_layers=1,
+        max_loop_iters=4,
+        max_seq_len=64,
+    )
+    tiny.update(overrides)
+    return OuroborosConfig(**tiny)
+
+
+# ===========================================================================
+# (1) OuroborosConfig — validation (implemented; not a stub)
+# ===========================================================================
+
+
+def test_config_defaults_and_tiny_config_construct() -> None:
+    """The default and tiny configs both pass ``__post_init__`` validation."""
+    OuroborosConfig()
+    cfg = tiny_config()
+    assert cfg.dim == 64
+    assert tiny_config(use_lti=False).use_lti is False
+
+
+def test_config_rejects_invalid_combinations() -> None:
+    """``__post_init__`` fails fast on each cross-field invariant violation."""
+    with pytest.raises(ValueError, match="divisible by n_heads"):
+        tiny_config(dim=65)
+    with pytest.raises(ValueError, match="must be even"):
+        tiny_config(dim=68)  # head_dim = 17, odd
+    with pytest.raises(ValueError, match="n_kv_heads"):
+        tiny_config(n_kv_heads=3)
+    with pytest.raises(ValueError, match="n_experts_per_tok"):
+        tiny_config(n_experts_per_tok=5)
+    with pytest.raises(ValueError, match="loop_index_dim"):
+        tiny_config(loop_index_dim=7)
 
 
 # ===========================================================================
@@ -194,42 +232,7 @@ def test_gqattention_causal_mask_blocks_future() -> None:
 
 
 # ===========================================================================
-# (5) MLAttention — Phase 2
-# ===========================================================================
-
-
-def test_mlattention_output_shape() -> None:
-    """MLAttention maps ``(B, T, dim)`` to ``(B, T, dim)``.
-
-    Built from a ``attn_type="mla"`` config, a forward pass must return a tensor
-    of the same ``(B, T, dim)`` shape (output projected by ``wo`` from
-    ``n_heads * v_head_dim`` back to ``dim``).
-    """
-    pytest.skip("stub — implement in Phase 2")
-
-
-def test_mlattention_cache_stores_compressed_latent() -> None:
-    """The MLA cache stores the compressed ``c_kv`` latent of width ``kv_lora_rank``.
-
-    After a forward pass with a cache, the stored ``c_kv`` for the ``cache_key``
-    must have last dimension ``kv_lora_rank`` (not the full ``n_heads ×
-    head_dim``), alongside a ``k_rope`` entry of last dimension
-    ``qk_rope_head_dim`` — confirming MLA caches the latent, not full K/V.
-    """
-    pytest.skip("stub — implement in Phase 2")
-
-
-def test_mlattention_cache_accumulates() -> None:
-    """The MLA compressed cache grows along the sequence axis across steps.
-
-    After a prefill of length ``T`` plus one decode step, the cached ``c_kv``
-    (and ``k_rope``) must have sequence length ``T + 1``.
-    """
-    pytest.skip("stub — implement in Phase 2")
-
-
-# ===========================================================================
-# (6) Expert — Phase 3
+# (5) Expert — Phase 3
 # ===========================================================================
 
 
@@ -243,7 +246,7 @@ def test_expert_output_shape() -> None:
 
 
 # ===========================================================================
-# (7) MoEFFN — Phase 3
+# (6) MoEFFN — Phase 3
 # ===========================================================================
 
 
@@ -290,7 +293,7 @@ def test_moeffn_update_router_bias_moves_load_toward_balance() -> None:
 
 
 # ===========================================================================
-# (9) loop_index_embedding — Phase 4
+# (8) loop_index_embedding — Phase 4
 # ===========================================================================
 
 
@@ -323,7 +326,7 @@ def test_loop_index_embedding_only_modifies_first_loop_dim_channels() -> None:
 
 
 # ===========================================================================
-# (10) LTIInjection — Phase 4
+# (9) LTIInjection — Phase 4
 # ===========================================================================
 
 
@@ -358,24 +361,15 @@ def test_lti_injection_spectral_radius_stays_below_one_after_huge_step() -> None
 
 
 # ===========================================================================
-# (8) TransformerBlock — Phase 4
+# (7) TransformerBlock — Phase 4
 # ===========================================================================
 
 
-def test_transformer_block_gqa_shape() -> None:
-    """A GQA ``TransformerBlock`` preserves the ``(B, T, dim)`` shape.
+def test_transformer_block_dense_shape() -> None:
+    """A dense ``TransformerBlock`` preserves the ``(B, T, dim)`` shape.
 
-    Built from an ``attn_type="gqa"`` config (``use_moe=False``), the pre-norm
+    Built with ``use_moe=False`` (the Prelude/Coda configuration), the pre-norm
     block must return ``(B, T, dim)``.
-    """
-    pytest.skip("stub — implement in Phase 4")
-
-
-def test_transformer_block_mla_shape() -> None:
-    """An MLA ``TransformerBlock`` preserves the ``(B, T, dim)`` shape.
-
-    Built from an ``attn_type="mla"`` config, the block must return ``(B, T,
-    dim)``.
     """
     pytest.skip("stub — implement in Phase 4")
 
@@ -389,17 +383,17 @@ def test_transformer_block_moe_shape() -> None:
     pytest.skip("stub — implement in Phase 4")
 
 
-def test_transformer_block_selects_attention_by_attn_type() -> None:
-    """``attn_type`` selects the attention class (``"mla"`` -> MLA, else GQA).
+def test_transformer_block_holds_gqa_attention() -> None:
+    """Every ``TransformerBlock`` holds a ``GQAttention`` sublayer.
 
-    A block built with ``attn_type="gqa"`` must hold a ``GQAttention`` instance,
-    and one built with ``attn_type="mla"`` must hold an ``MLAttention`` instance.
+    The block's ``attn`` submodule must be a ``GQAttention`` instance — the
+    single attention mechanism in the architecture.
     """
     pytest.skip("stub — implement in Phase 4")
 
 
 # ===========================================================================
-# (11) RecurrentBlock — Phase 4
+# (10) RecurrentBlock — Phase 4
 # ===========================================================================
 
 
@@ -427,5 +421,16 @@ def test_recurrent_block_single_loop_runs() -> None:
 
     The loop body must be well-defined for the minimal depth of one iteration
     (no off-by-one in the loop or cache-key construction).
+    """
+    pytest.skip("stub — implement in Phase 4")
+
+
+def test_recurrent_block_use_lti_false_builds_naive_injection() -> None:
+    """``use_lti=False`` builds no ``LTIInjection`` and still runs the loop.
+
+    A block built from ``tiny_config(use_lti=False)`` must have
+    ``injection is None``, run the naive residual update
+    ``h = transformer_out + e`` without error, and return ``(B, T, dim)`` —
+    the ablation arm of the stability experiment.
     """
     pytest.skip("stub — implement in Phase 4")

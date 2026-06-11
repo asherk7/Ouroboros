@@ -18,8 +18,9 @@ Intended pipeline (T4-realistic, ~10-30M-param model)
    where ``targets`` is ``input_ids`` shifted by one position.
 
 3. **Model.** Instantiate ``Ouroboros(cfg)``, move to device, and (on T4) wrap the
-   forward/backward in autocast. The model precomputes both RoPE buffers and
-   selects GQA or MLA per ``cfg.attn_type``.
+   forward/backward in autocast. The model precomputes its RoPE buffer at build
+   time; ``cfg.use_lti`` decides whether the recurrent block carries the LTI
+   injection or the naive ablation update.
 
 4. **Optimizer / schedule.** ``AdamW`` with ``betas=(0.9, 0.95)``,
    ``weight_decay=0.1`` (decay applied to matmul weights only; biases, norms, and
@@ -44,21 +45,24 @@ Intended pipeline (T4-realistic, ~10-30M-param model)
    norm, learning rate, and throughput in tokens/second.
 
 8. **Stability comparison.** The ``--lti`` / ``--no-lti`` toggle drives the
-   headline stability experiment. ``--no-lti`` disables the LTI constraint on the
-   recurrent injection (replacing the spectrally bounded update with a naive
-   residual one); at a high learning rate the un-constrained run is expected to
-   destabilize and diverge while the LTI run converges cleanly. Both runs share
-   config, data, and seed so the only independent variable is the injection rule.
+   headline stability experiment by setting ``OuroborosConfig.use_lti`` (an
+   *architecture* switch — the model builds no ``LTIInjection`` when it is
+   ``False`` and uses the naive residual update ``h = transformer_out + e``
+   instead). At a high learning rate the un-constrained run is expected to
+   destabilize and diverge (loss spike / NaN) while the LTI run converges
+   cleanly. Both runs share config, data, and seed so the only independent
+   variable is the injection rule. ``rho(A)`` is logged for the LTI arm only —
+   the naive arm has no ``A`` matrix.
 
-Usage
------
+Usage (from the repo root, after ``pip install -e .``)
+-------------------------------------------------------
 .. code-block:: bash
 
     # LTI-constrained training run (the stable baseline)
-    python -m ouroboros.training.train --lti --lr 3e-3 --wandb-project ouroboros
+    python training/train.py --lti --lr 3e-3 --wandb-project ouroboros
 
     # Un-constrained comparison run (expected to diverge at high LR)
-    python -m ouroboros.training.train --no-lti --lr 3e-3 --wandb-project ouroboros
+    python training/train.py --no-lti --lr 3e-3 --wandb-project ouroboros
 
 This file deliberately contains no implementation; see the module roadmap in
 ``docs/ROADMAP.md`` (Phase 6).
@@ -67,9 +71,14 @@ This file deliberately contains no implementation; see the module roadmap in
 from __future__ import annotations
 
 import argparse
+
+# random/numpy are consumed by set_seed() once its body is implemented; the noqa
+# keeps the scaffold lint-clean while the body remains `raise NotImplementedError`.
+import random  # noqa: F401
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+import numpy as np  # noqa: F401
 import torch
 from torch.utils.data import DataLoader
 
@@ -109,8 +118,6 @@ class TrainConfig:
             ``0.999`` Adam default, for stabler LLM pretraining).
         grad_clip: Global gradient-norm clip threshold.
         n_loops: Recurrent depth ``T`` used during training.
-        use_lti: If ``True`` use the LTI-constrained injection; if ``False`` run
-            the unstable comparison configuration (see module docstring).
         precision: ``"fp16"`` (T4) or ``"bf16"`` (Ampere+). ``"fp16"`` enables
             the ``GradScaler``.
         seed: RNG seed for ``random``, ``numpy``, and ``torch`` reproducibility.
@@ -138,7 +145,6 @@ class TrainConfig:
     beta2: float = 0.95
     grad_clip: float = 1.0
     n_loops: int = 8
-    use_lti: bool = True
     precision: str = "fp16"
     seed: int = 1337
     log_interval: int = 10
@@ -274,11 +280,15 @@ def spectral_radius(model: Ouroboros) -> float:
 
     Because ``A`` is diagonal, ``rho(A) == max(model.recurrent.injection.get_A())``.
     This is the cheap, continuous stability signal logged every step: under the
-    LTI constraint it must stay strictly below 1.0 for all training; an
-    un-constrained run is expected to push it toward or past 1.0 as it diverges.
+    LTI constraint it must stay strictly below 1.0 for all training.
+
+    Only defined for models built with ``use_lti=True``: the no-LTI ablation arm
+    has no ``LTIInjection`` (``model.recurrent.injection is None``), so callers
+    must skip this metric for that arm rather than call it.
 
     Args:
-        model: The ``Ouroboros`` model.
+        model: The ``Ouroboros`` model (must have been built with
+            ``use_lti=True``).
 
     Returns:
         The largest diagonal entry of the discretized state matrix ``A`` as a
@@ -332,9 +342,11 @@ def train(
        ``val_loader`` is provided).
     7. Every ``ckpt_interval`` steps, checkpoint model + optimizer + step.
 
-    When ``train_cfg.use_lti`` is ``False``, the run uses the unstable comparison
-    configuration; at high LR it is expected to diverge (NaN/inf loss, ``rho(A)``
-    drifting toward 1), which is the point of the stability experiment.
+    When the model was built with ``OuroborosConfig.use_lti = False``, the run
+    uses the unstable comparison configuration; at high LR it is expected to
+    diverge (loss spike / NaN), which is the point of the stability experiment.
+    ``rho(A)`` logging (step 5) applies to LTI runs only — the naive arm has no
+    ``A`` matrix to monitor.
 
     Args:
         model: The ``Ouroboros`` model to train (already on device).
@@ -372,7 +384,7 @@ def parse_args() -> argparse.Namespace:
     """Define and parse command-line arguments for a training run.
 
     Exposes the architecture knobs that matter for a T4 run (``--dim``,
-    ``--n-loops``, ``--attn-type``, ``--vocab-size``) and the optimization knobs
+    ``--n-loops``, ``--vocab-size``) and the optimization knobs
     (``--lr``, ``--max-steps``, ``--batch-size``, ``--grad-accum-steps``,
     ``--warmup-steps``, ``--precision``). Two mutually exclusive flags drive the
     stability experiment:
@@ -396,7 +408,10 @@ def build_configs(
 
     Resolves ``--tiny`` to the smoke-test architecture (e.g. ``dim=64``,
     ``n_heads=4``) versus the default ~10-30M T4 training architecture, and maps
-    the ``--lti`` / ``--no-lti`` flag onto ``TrainConfig.use_lti``.
+    the ``--lti`` / ``--no-lti`` flag onto ``OuroborosConfig.use_lti`` (an
+    architecture switch — it decides whether the model builds an
+    ``LTIInjection`` at all, so it lives on the model config, not the train
+    config).
 
     Args:
         args: Parsed CLI namespace from :func:`parse_args`.

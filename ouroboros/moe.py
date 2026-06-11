@@ -164,6 +164,11 @@ class MoEFFN(nn.Module):
         subsequent :meth:`update_router_bias` call (no autograd through either
         the bias or the load counter).
 
+        ``expert_load`` accumulation is gated on ``self.training``: eval /
+        generation forwards must NOT add to the counter, or validation passes
+        between optimizer steps would contaminate the balance signal with a
+        token distribution the optimizer never trained on.
+
         Args:
             x: Input tensor of shape ``(B, T, dim)``.
 
@@ -188,7 +193,13 @@ class MoEFFN(nn.Module):
         affects SELECTION (never the gating weights), this rebalances which
         experts fire without touching the gradient or the LM loss.
 
-        Called once per optimizer step by the training loop. Runs under
-        ``torch.no_grad()`` and mutates buffers in place; returns nothing.
+        Call **once per optimizer step — not per micro-batch**. Under gradient
+        accumulation, ``expert_load`` is meant to accumulate across all
+        micro-batches of one effective batch; calling this per micro-batch
+        resets the counter before it has seen the full batch and biases the
+        update toward whichever micro-batch ran last. (``expert_load`` also only
+        accumulates while ``self.training`` is ``True`` — see :meth:`forward`.)
+        Runs under ``torch.no_grad()`` and mutates buffers in place; returns
+        nothing.
         """
         raise NotImplementedError

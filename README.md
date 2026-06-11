@@ -1,6 +1,6 @@
 # Ouroboros
 
-**A recurrent-depth (looped) transformer in PyTorch — a Prelude / Recurrent / Coda design with fine-grained MoE, switchable MLA/GQA attention, and LTI-constrained stable looping.**
+**A recurrent-depth (looped) transformer in PyTorch — a Prelude / Recurrent / Coda design with fine-grained MoE, GQA attention, and LTI-constrained stable looping.**
 
 Ouroboros is a recurrent-depth transformer (RDT): instead of stacking more unique
 layers, a single transformer block is *looped* a variable number of times with
@@ -11,9 +11,8 @@ than were used during training.
 
 The architecture is grounded in the recurrent-depth / looped-transformer
 literature: Universal Transformers for the looped core, Parcae for the LTI
-stability constraint, and DeepSeek-V2 (MLA) and DeepSeekMoE / DeepSeek-V3 for
-attention and mixture-of-experts. See
-[`docs/READING_LIST.md`](docs/READING_LIST.md) for the full bibliography.
+stability constraint, and DeepSeekMoE / DeepSeek-V3 for the mixture-of-experts.
+See [`docs/READING_LIST.md`](docs/READING_LIST.md) for the full bibliography.
 
 ---
 
@@ -25,18 +24,18 @@ attention and mixture-of-experts. See
   diagonal state matrix has spectral radius `ρ(A) < 1` by construction, keeping the
   loop contractive and training stable at high learning rates without gradient
   clipping or hidden-state normalization.
-- **Switchable attention** — Grouped-Query Attention (GQA) or Multi-Latent
-  Attention (MLA, with a compressed KV-cache latent), selected via a single config
-  field.
+- **Grouped-Query Attention (GQA)** — fewer KV heads than query heads for a
+  smaller KV cache, with a FlashAttention-2 / SDPA-flash fast path and a manual
+  fallback.
 - **Fine-grained Mixture-of-Experts** in the recurrent block — routed plus
   always-on shared experts, with aux-loss-free load balancing via a router-bias
   update (DeepSeek-V3).
 - **Depth extrapolation** — a fixed loop count at training time, with a sinusoidal
   loop-index signal that lets the shared weights run deeper at inference than they
   were trained on.
-- **Optimized inference** — FlashAttention-2 with a `scaled_dot_product_attention`
-  fallback, INT8 post-training quantization, and continuous depth-wise batching
-  (sequences exit the loop at different convergence-driven depths within one batch).
+- **Optimized inference** — KV-cached decoding and continuous depth-wise batching
+  (sequences exit the loop at different convergence-driven depths within one
+  batch), the source of the headline throughput multiplier.
 - **Compact and single-GPU friendly** — defaults target a small model trainable on a
   single consumer / Colab-class GPU (e.g. a 16 GB T4).
 
@@ -59,7 +58,7 @@ attention and mixture-of-experts. See
  │  for t in range(n_loops):                                        │
  │    h_loop   = loop_index_embedding(h, t, loop_dim)   # sinusoid  │
  │    combined = RMSNorm(h_loop + e)                                │
- │    trans    = TransformerBlock(combined, ...)  # MLA/GQA + MoE   │
+ │    trans    = TransformerBlock(combined, ...)  # GQA + MoE       │
  │    h        = LTIInjection(h, e, trans)  # h = A·h + B·e + trans │
  └──────────────────────────────────────────────────────────────────┘
       │  x := h (B, T, dim) — final hidden state after n_loops
@@ -99,8 +98,9 @@ cd Ouroboros
 pip install -e .            # or: pip install -r requirements.txt
 ```
 
-Optional inference fast paths (`flash-attn`, `bitsandbytes`) can be installed with
-the `fast` extra; they are not required (`flash-attn` targets Ampere+ GPUs):
+The optional inference fast path (`flash-attn`) can be installed with the
+`fast` extra; it is not required (`flash-attn` targets Ampere+ GPUs — on a T4
+the SDPA flash backend is the realistic path):
 
 ```bash
 pip install -e ".[fast]"
@@ -125,13 +125,13 @@ logits = model(input_ids)
 tokens = model.generate(input_ids, max_new_tokens=64, n_loops=8)
 ```
 
-Attention type and loop depth are set on the config:
+Model size and loop depth are set on the config:
 
 ```python
 cfg = OuroborosConfig(
-    attn_type="mla",        # "gqa" (default) or "mla"
     dim=512,
     max_loop_iters=8,       # default recurrent depth
+    use_lti=True,           # False = naive injection (the stability-ablation arm)
 )
 ```
 
@@ -155,7 +155,7 @@ Training and inference benchmarking entry points live in
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | The build phases — goals, components, and acceptance criteria. |
 | [`docs/DESIGN_DECISIONS.md`](docs/DESIGN_DECISIONS.md) | Major design choices: alternatives, rationale, and tradeoffs. |
 | [`docs/READING_LIST.md`](docs/READING_LIST.md) | The papers behind each component, organized by what to focus on. |
-| [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md) | Experiment plans and result templates (LTI stability, MLA vs GQA, MoE, INT8, depth-wise batching, loop sweep). |
+| [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md) | Experiment plans and result templates (LTI stability, depth extrapolation, inference throughput). |
 
 ---
 

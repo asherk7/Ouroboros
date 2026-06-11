@@ -8,15 +8,16 @@
 ## What Ouroboros is
 
 Ouroboros is an honest, from-scratch implementation inspired by the recurrent-depth
-transformer literature (Universal Transformers, Parcae, DeepSeek-V2/V3, DeepSeekMoE).
+transformer literature (Universal Transformers, Parcae, DeepSeekMoE, DeepSeek-V3).
 It is a **Prelude / Recurrent / Coda** design: a few
 dense blocks encode the input once (Prelude), a single weight-tied block is looped `T`
 times with stable input injection (Recurrent Block), and a few dense blocks decode the
 result once (Coda). The loop carries fine-grained MoE (routed + shared experts),
-switchable MLA/GQA attention, a sinusoidal loop-index embedding, and
+GQA attention, a sinusoidal loop-index embedding, and
 LTI-constrained injection for stability (a fixed loop count — no adaptive halting).
-Beyond the literature, Ouroboros adds **INT8 quantized inference** and **continuous
-depth-wise batching** as the inference differentiators.
+On the inference side, the differentiators are **KV-cached generation**, an **SDPA
+flash/mem-efficient fast path**, and **continuous depth-wise batching** — the last
+being the beyond-the-literature piece.
 
 This is a planning/documentation phase: the scaffold is API contracts (signatures +
 docstrings) only. The roadmap below sequences the *implementation* that will fill those
@@ -26,19 +27,21 @@ contracts.
 
 1. **Architecture (Phases 1–5).** "Implemented a recurrent-depth (looped) transformer
    from scratch in PyTorch — a Prelude/Recurrent/Coda design with fine-grained MoE
-   (routed + shared experts) and switchable MLA/GQA attention."
+   (routed + shared experts) and GQA attention."
 2. **Stability (Phases 4 & 6).** "Stabilized looped training via LTI-constrained
    injection (negative-diagonal state matrix, spectral radius < 1), enabling clean
    convergence at high learning rates."
-3. **Inference (Phase 7).** "Integrated FlashAttention-2 and INT8 quantized inference
-   with continuous depth-wise batching, achieving **[X]×** inference throughput on a
-   single GPU." (`[X]` is the measured multiplier produced in Phase 7.)
+3. **Inference (Phase 7).** "Integrated FlashAttention-2/SDPA attention and KV-cached
+   decode with continuous depth-wise batching, achieving **[X]×** inference throughput
+   on a single GPU." (`[X]` is the measured multiplier produced in Phase 7.)
 
 Bullets 1–2 are *build + train the architecture*. Bullet 3 is *go beyond the
-literature*: INT8 PTQ and continuous depth-wise batching are the novel pieces;
-FlashAttention-2 integration is table-stakes but must be made to *actually work* on T4
-(realistic path = `F.scaled_dot_product_attention` flash/mem-efficient backend with a
-manual fallback; the `flash_attn_func` kernel is kept as an optional Ampere fast path).
+literature*: continuous depth-wise batching is the novel piece, layered on KV-cached
+decode; FlashAttention-2 integration is table-stakes but must be made to *actually
+work* on T4 (realistic path = `F.scaled_dot_product_attention` flash/mem-efficient
+backend with a manual fallback; the `flash_attn_func` kernel is kept as an optional
+Ampere fast path). INT8 quantization was cut from scope: at 10–30M params the fp16
+model is ~40 MB, and quantization has no honest story at that scale.
 
 ---
 
@@ -51,7 +54,7 @@ manual fallback; the `flash_attn_func` kernel is kept as an optional Ampere fast
         ├──────────────┬───────────────┐                 │
         ▼              ▼               ▼                  │
  Phase 2 Attention  Phase 3 MoE   Phase 4 Recurrence ◄────┘  (P4 needs P1–P3)
- (GQA, MLA)         (Expert,      (LTIInjection, loop_index_embedding,
+ (GQA)              (Expert,      (LTIInjection, loop_index_embedding,
         │            MoEFFN)       TransformerBlock, RecurrentBlock)
         │              │
         └──────┬───────┴───────────────┐
@@ -62,7 +65,7 @@ manual fallback; the `flash_attn_func` kernel is kept as an optional Ampere fast
         Phase 6  Training (single-GPU; LTI vs no-LTI; W&B; MoE bias step)
                │
                ▼
-        Phase 7  Inference optimization (INT8, FA2/SDPA, depth-wise batching)
+        Phase 7  Inference optimization (FA2/SDPA, depth-wise batching, throughput bench)
                │
                ▼
         Phase 8  Polish (README, diagrams, benchmark table, tests/lint green)
@@ -75,24 +78,25 @@ together attention (P2) and `MoEFFN` (P3).
 
 ### Effort summary
 
-Estimates assume ~4–6 focused hours/day. The build-from-reference timeline can compress
+Estimates assume ~4–6 focused hours/day; this is a no-deadline summer build, so they
+size the work rather than set a schedule. The build-from-reference timeline can compress
 because the math and shapes are well understood up front; the spread reflects
-"smooth run" vs "debugging the subtle bits" (KV-cache decode correctness, dual RoPE
-buffers, `start_pos` decode slicing, fp16 stability). **Phases 1–5 ≈ ~10 days** is the
+"smooth run" vs "debugging the subtle bits" (KV-cache decode correctness, `start_pos`
+decode slicing, fp16 stability). **Phases 1–5 ≈ ~8–9 days** is the
 realistic architecture-build target.
 
 | Phase | Name | Effort (days) | Depends on |
 |------:|------|:-------------:|------------|
 | 1 | Skeleton | ~1 | — |
-| 2 | Attention | ~2–3 | 1 |
+| 2 | Attention | ~1–1.5 | 1 |
 | 3 | MoE FFN | ~2 | 1 |
 | 4 | Recurrence machinery | ~2–3 | 1, 2, 3 |
 | 5 | Full model + generation | ~2 | 1, 2, 3, 4 |
-| **1–5 subtotal** | **Architecture** | **~10** | |
+| **1–5 subtotal** | **Architecture** | **~8–9** | |
 | 6 | Training | ~3–4 | 5 |
-| 7 | Inference optimization | ~3–4 | 5 (6 for ppl baselines) |
+| 7 | Inference optimization | ~2–3 | 5 (6 for trained weights) |
 | 8 | Polish | ~2 | 1–7 |
-| **Total** | | **~18–20** | |
+| **Total** | | **~15–18** | |
 
 A note on calendar vs effort: T4 training and benchmark runs (Phases 6–7) include
 wall-clock waiting for runs to finish that does not consume focused engineering hours;
@@ -144,23 +148,17 @@ in `apply_rope`.
 
 ## Phase 2 — Attention
 
-**Goal.** Implement both attention mechanisms behind a single switch (`cfg.attn_type`),
-with a correct KV-cache contract and a realistic FlashAttention-2/SDPA fast path plus
-fallback. Build GQA first (simpler, has the FA2 fast path), then MLA.
+**Goal.** Implement GQA attention with a correct KV-cache contract and a realistic
+FlashAttention-2/SDPA fast path plus fallback.
 
 **Components built** (exact names):
 - `GQAttention` — `attention.py` (Grouped Query Attention; `head_dim = dim // n_heads`,
   `groups = n_heads // n_kv_heads`; RoPE on Q and K; K/V cached *after* RoPE).
-- `MLAttention` — `attention.py` (DeepSeek-V2 compressed-KV attention; Q low-rank path,
-  KV low-rank latent `c_kv` cached, decoupled RoPE on `qk_rope_head_dim`).
 
 **Acceptance criteria** (concrete):
 - **GQA smoke + shape.** `GQAttention(cfg)(x, freqs_cis, mask)` maps `(B, T, dim) →
   (B, T, dim)` with no NaN; works for the tiny and default configs; asserts
   `n_heads % n_kv_heads == 0`.
-- **MLA smoke + shape.** `MLAttention(cfg)(x, freqs_cis_mla, mask)` maps `(B, T, dim) →
-  (B, T, dim)` with no NaN; uses the **separate** MLA RoPE buffer sized to
-  `qk_rope_head_dim` (verify it does *not* read the GQA-sized `freqs_cis`).
 - **Fast-path / fallback parity.** With and without the flash/mem-efficient SDPA backend
   (toggle `torch.backends.cuda.sdp_kernel`), GQA outputs agree to within `1e-2` (bf16
   tolerance). If `_HAS_FLASH_ATTN` and an Ampere GPU is available, `flash_attn_func`
@@ -170,20 +168,14 @@ fallback. Build GQA first (simpler, has the FA2 fast path), then MLA.
   token-by-token through a shared `kv_cache` dict produces the same final-token output
   to within `1e-3`. Cache stores `{cache_key: {"k", "v"}}`, concatenated along seq dim,
   `.detach()`ed.
-- **MLA cache is compressed.** `MLAttention` caches `{"c_kv": (B,S,kv_lora_rank),
-  "k_rope": (B,S,H,qk_rope_head_dim)}` — assert `c_kv.shape[-1] == kv_lora_rank` and
-  that **MLA cache bytes < GQA cache bytes** for the same `(B, S)` (the headline MLA win;
-  log the ratio).
 - **Mask dtype guard.** An additive causal mask whose dtype matches activation dtype is
   required; a test that passes an fp32 mask against fp16/bf16 activations documents/asserts
   the upcast hazard in the fallback path.
 
-**Estimated effort.** ~2–3 days. GQA is ~half a day; MLA's two-path Q/KV reconstruction,
-decoupled RoPE, and compressed cache are the time sink. FA2-on-T4 realism (SDPA backend
-selection + fallback) adds debugging time.
+**Estimated effort.** ~1–1.5 days. GQA itself is ~half a day; FA2-on-T4 realism (SDPA
+backend selection + fallback) adds the debugging time.
 
-**Dependencies.** Phase 1 (`OuroborosConfig`, `RMSNorm` used inside MLA's `q_norm`/
-`kv_norm`, `apply_rope`, `precompute_rope_freqs`).
+**Dependencies.** Phase 1 (`OuroborosConfig`, `apply_rope`, `precompute_rope_freqs`).
 
 ---
 
@@ -243,7 +235,7 @@ the component level.
   `loop_dim` channels).
 - `LTIInjection` — `recurrence.py` (`log_A`, `log_dt`, `B`; `get_A()`; `forward` →
   `A·h + B·e + transformer_out`).
-- `TransformerBlock` — `block.py` (pre-norm; attention from `attn_type`; FFN = `MoEFFN`
+- `TransformerBlock` — `block.py` (pre-norm; `GQAttention`; FFN = `MoEFFN`
   if `use_moe` else dense `Expert`; two `RMSNorm`s; residual + dropout).
 - `RecurrentBlock` — `recurrence.py` (owns `block` (use_moe=True), `injection`, `norm`,
   `loop_dim = loop_index_dim or dim // 8`; runs the fixed-depth loop per spec §3).
@@ -267,13 +259,13 @@ the component level.
   of range.
 - **TransformerBlock parity with `use_moe`.** `TransformerBlock(cfg, use_moe=False)` uses
   a dense `Expert(dim, dim*4//3)`; `use_moe=True` uses `MoEFFN`; both map
-  `(B, T, dim) → (B, T, dim)` with no NaN for GQA and MLA `attn_type`.
+  `(B, T, dim) → (B, T, dim)` with no NaN.
 - **Fixed-depth loop populates all cache keys.** With a non-None `kv_cache`, a forward
   runs every loop depth and populates cache keys `recurrent_loop_{0..n_loops-1}`, so the
   standard decode path (Phase 5) and depth-wise batching (Phase 7) inherit a fully
   populated cache with no early-exit edge case.
 
-**Estimated effort.** ~2–3 days. `LTIInjection`'s log-space ZOH math and the dual-RoPE /
+**Estimated effort.** ~2–3 days. `LTIInjection`'s log-space ZOH math and the
 per-depth cache-key wiring in `RecurrentBlock` are the subtle parts; getting them right
 here means Phase 5/7 inherit a correct loop.
 
@@ -289,8 +281,8 @@ Block → Coda → tied head) and implement KV-cached autoregressive generation.
 completes resume bullet 1 — a runnable from-scratch recurrent-depth transformer.
 
 **Components built** (exact names):
-- `Ouroboros` — `model.py` (`__init__` builds `embed`, dual RoPE buffers `freqs_cis`
-  (size `dim//n_heads`) and `freqs_cis_mla` (size `qk_rope_head_dim`), `prelude`
+- `Ouroboros` — `model.py` (`__init__` builds `embed`, the RoPE buffer `freqs_cis`
+  (size `dim//n_heads`), `prelude`
   `ModuleList`, `recurrent` `RecurrentBlock`, `coda` `ModuleList`, final `RMSNorm`,
   tied `head`).
 - `Ouroboros._init_weights` — `N(0, init_std)` on Linear & Embedding.
@@ -303,14 +295,10 @@ completes resume bullet 1 — a runnable from-scratch recurrent-depth transforme
   implementation is Phase 7.
 
 **Acceptance criteria** (concrete):
-- **Forward shape + no NaN, both attention types.** `Ouroboros(cfg).forward(input_ids)`
-  returns `(B, T, vocab_size)` with no NaN for `attn_type="gqa"` **and** `attn_type="mla"`
-  (tiny and default configs).
+- **Forward shape + no NaN.** `Ouroboros(cfg).forward(input_ids)`
+  returns `(B, T, vocab_size)` with no NaN (tiny and default configs).
 - **Weight tying.** `model.head.weight is model.embed.weight` (same storage); a gradient
   step updates both views consistently.
-- **Dual RoPE selection.** With `attn_type="mla"`, `forward` slices `freqs_cis_mla`;
-  with `"gqa"`, it slices `freqs_cis` — assert the right buffer is used and that it is
-  sliced `[start_pos : start_pos + T]`.
 - **Cached-decode logits ≈ full-context.** For a fixed sequence, the per-step
   KV-cached decode logits match a single full-context forward pass to within `1e-3`
   (the core correctness invariant for generation; depends on the Phase 4 cache-population
@@ -327,7 +315,7 @@ completes resume bullet 1 — a runnable from-scratch recurrent-depth transforme
   error — the sinusoidal loop-index is defined at any depth — and the output changes).
 
 **Estimated effort.** ~2 days. Most components exist by now; the work is wiring,
-weight tying, the dual-RoPE selection, and getting cached decode bit-exact against full
+weight tying, and getting cached decode bit-exact against full
 context (the `start_pos` slicing and the Phase-4 cache-population rule are where bugs hide).
 
 **Dependencies.** Phases 1–4 (everything the model composes).
@@ -348,9 +336,9 @@ update into the loop.
   a per-step call to `MoEFFN.update_router_bias()` across the model.
 - W&B logging of: loss, **`ρ(A) = max(model.recurrent.injection.get_A())`**, gradient
   norm, tokens/s, and learning rate.
-- An ablation switch to run **LTI vs no-LTI** (the no-LTI variant replaces the stable
-  update with a naive `h = transformer_out + e` style injection) for the stability
-  experiment.
+- The **LTI vs no-LTI** ablation switch: `cfg.use_lti` (default `True`); `use_lti=False`
+  replaces the stable update with a naive `h = transformer_out + e` injection for the
+  stability experiment (2 seeds per arm).
 
 **Acceptance criteria** (concrete):
 - **Loss decreases + stable convergence.** On the tiny dataset, training loss decreases
@@ -380,33 +368,20 @@ LTI-vs-no-LTI divergence plot are the time sinks.
 
 ## Phase 7 — Inference optimization
 
-**Goal.** Produce the inference multiplier for resume bullet 3: INT8 post-training
-quantization, a cleaned-up FA2/SDPA path, and **continuous depth-wise batching**, each
-benchmarked against an un-optimized baseline.
+**Goal.** Produce the inference multiplier for resume bullet 3: a cleaned-up FA2/SDPA
+path and **continuous depth-wise batching** over KV-cached decode. The headline **[X]×**
+is depth-wise batched decode vs naive fixed-depth decode; KV-cache on/off is a
+supporting ablation.
 
 **Components built** (exact names):
-- `quantize_int8(model, method)` — `quantize.py` (per-channel weight quantization of the
-  large Linears — attention projections, expert FFNs — keeping norms/router/LM head in
-  higher precision; `torch.ao.quantization` dynamic/static or `bitsandbytes` Int8).
-- `INT8Linear` — `quantize.py`.
-- `calibrate(model, calibration_loader)` — `quantize.py` (static PTQ).
-- `quantization_error(fp_model, int8_model, eval_loader)` — `quantize.py` (perplexity
-  delta + related metrics).
 - `Ouroboros.generate_depthwise_batched(input_ids, max_new_tokens, max_loops,
   convergence_tol, temperature, top_k)` — `model.py` (the inference differentiator;
   per-sequence convergence-based early exit, solving the cache-key population problem it
   creates).
-- `benchmarks/throughput.py` — prefill/decode latency, depth sweep, INT8 on/off, and
-  depth-wise batching on/off; reports the end-to-end multiplier.
+- `benchmarks/throughput.py` — prefill/decode latency, loop-depth sweep, depth-wise
+  batching on/off, and KV-cache on/off; reports the end-to-end multiplier.
 
 **Acceptance criteria** (concrete):
-- **INT8 perplexity delta measured & acceptable.** `quantization_error(...)` reports the
-  perplexity of fp16 vs INT8 on a held-out slice; the delta is small (target: within a
-  few percent of fp16 ppl) and documented. INT8 model memory footprint is measurably
-  smaller than fp16.
-- **INT8 correctness.** `INT8Linear` output matches its fp `nn.Linear` source within the
-  expected quantization tolerance on random inputs; norms/router/LM head remain unquantized
-  (asserted).
 - **Depth-wise batching gives a measured throughput gain.** With a batch whose sequences
   converge at different depths, `generate_depthwise_batched` produces **higher tokens/s**
   than the naive `generate` that pays max depth for every sequence — and produces
@@ -417,21 +392,25 @@ benchmarked against an un-optimized baseline.
   (run-to-max-active-depth-with-masking, ragged/compacted cache, or depth-bucketing) is
   implemented and validated: a later decode step that loops deeper never reads a missing
   cache key.
+- **KV-cache ablation measured.** `benchmarks/throughput.py` reports decode throughput
+  with the KV cache on vs off (recompute-from-scratch baseline) — the supporting
+  ablation under the headline number.
 - **FA2/SDPA path clean on T4.** The SDPA flash/mem-efficient backend is used where
   available with a working manual fallback; `flash_attn_func` remains an optional Ampere
   fast path. Benchmarked honestly (no claim of a native FA2 kernel on Turing).
 - **End-to-end multiplier reported.** `benchmarks/throughput.py` emits a single
-  **[X]× throughput** number (optimized vs un-optimized baseline on one GPU) that fills
-  resume bullet 3 and [`EXPERIMENTS.md`](./EXPERIMENTS.md) experiments 4–5.
+  **[X]× throughput** number (depth-wise batched decode vs naive fixed-depth decode on
+  one GPU) that fills resume bullet 3 and [`EXPERIMENTS.md`](./EXPERIMENTS.md)
+  experiment 3.
 
-**Estimated effort.** ~3–4 days focused engineering (plus wall-clock for benchmark
+**Estimated effort.** ~2–3 days focused engineering (plus wall-clock for benchmark
 sweeps). Depth-wise batching's cache-key bookkeeping is the hardest part of the whole
-project after the Phase-4 loop; INT8 backend selection and honest benchmarking add time.
+project after the Phase-4 loop; honest benchmarking adds time.
 
 **Dependencies.** Phase 5 (model + KV-cache + the `generate_depthwise_batched` stub).
-Phase 6 is a soft dependency: trained weights and the fp16 perplexity baseline make the
-INT8 and throughput comparisons meaningful (you can prototype on random weights, but the
-reported numbers should come from a trained model).
+Phase 6 is a soft dependency: trained weights make the convergence-depth distribution —
+and therefore the throughput numbers — meaningful (you can prototype on random weights,
+but the reported numbers should come from a trained model).
 
 ---
 
@@ -446,8 +425,8 @@ benchmark table with the measured multiplier, and a green, lint-clean codebase.
   every doc in `docs/`.
 - Architecture diagram + W&B curve references (stability plot, loss curves,
   convergence-depth distribution) embedded/linked.
-- Benchmark table populated with real Phase 6–7 numbers (perplexity, KV-cache memory
-  MLA vs GQA, INT8 ppl delta, depth-wise batching throughput, end-to-end **[X]×**).
+- Benchmark table populated with real Phase 6–7 numbers (perplexity, prefill/decode
+  latency, KV-cache and depth-wise-batching ablations, end-to-end **[X]×**).
 - Final pass on docstrings/type hints across all modules; `EXPERIMENTS.md`,
   `DESIGN_DECISIONS.md`, `READING_LIST.md`, `ARCHITECTURE.md` cross-checked for
   consistency with the shipped code.

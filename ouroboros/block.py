@@ -1,4 +1,4 @@
-"""Pre-norm transformer block with swappable attention and FFN for Ouroboros.
+"""Pre-norm transformer block with a swappable FFN for Ouroboros.
 
 ``TransformerBlock`` is the single reusable layer type used everywhere a
 standard transformer step is needed:
@@ -6,15 +6,10 @@ standard transformer step is needed:
 - In the **Prelude** and **Coda** (run once each), with a dense SwiGLU FFN.
 - Inside the **RecurrentBlock** (looped), with a Mixture-of-Experts FFN.
 
-Two axes are swappable:
-
-- **Attention** is chosen by ``cfg.attn_type``: ``"mla"`` selects
-  :class:`~ouroboros.attention.MLAttention` (DeepSeek-V2 compressed-KV
-  attention); any other value (default ``"gqa"``) selects
-  :class:`~ouroboros.attention.GQAttention` (grouped-query attention).
-- **FFN** is chosen by the ``use_moe`` constructor flag: ``True`` uses
-  :class:`~ouroboros.moe.MoEFFN`; ``False`` uses a dense
-  :class:`~ouroboros.moe.Expert` with hidden width ``dim * 4 // 3``.
+Attention is always :class:`~ouroboros.attention.GQAttention`. The **FFN** is
+chosen by the ``use_moe`` constructor flag: ``True`` uses
+:class:`~ouroboros.moe.MoEFFN`; ``False`` uses a dense
+:class:`~ouroboros.moe.Expert` with hidden width ``dim * 4 // 3``.
 
 The block is pre-norm with a residual connection (and dropout) around each
 sublayer::
@@ -39,12 +34,11 @@ __all__ = ["TransformerBlock"]
 
 
 class TransformerBlock(nn.Module):
-    """Pre-norm transformer block with swappable attention and FFN.
+    """Pre-norm transformer block with GQA attention and a swappable FFN.
 
     Composition:
 
-    - ``attn``: :class:`~ouroboros.attention.MLAttention` if
-      ``cfg.attn_type == "mla"`` else :class:`~ouroboros.attention.GQAttention`.
+    - ``attn``: :class:`~ouroboros.attention.GQAttention`.
     - ``ffn``: :class:`~ouroboros.moe.MoEFFN` if ``use_moe`` else a dense
       :class:`~ouroboros.moe.Expert` of hidden width ``cfg.dim * 4 // 3``.
     - Two :class:`~ouroboros.norm.RMSNorm` instances (one before attention, one
@@ -67,10 +61,11 @@ class TransformerBlock(nn.Module):
         """Build the norms, attention sublayer, and FFN sublayer.
 
         Args:
-            cfg: Model configuration. ``cfg.attn_type`` selects the attention
-                class (``"mla"`` -> MLAttention, else GQAttention); ``cfg.dim``
-                sizes the norms and the dense FFN width (``cfg.dim * 4 // 3``);
-                ``cfg.dropout`` sets the residual-branch dropout. MoE fields are
+            cfg: Model configuration. ``cfg.dim`` sizes the norms and the dense
+                FFN width (``cfg.dim * 4 // 3``); ``cfg.dropout`` sets the
+                residual-branch dropout. Attention fields (``n_heads``,
+                ``n_kv_heads``) are consumed via
+                :class:`~ouroboros.attention.GQAttention`; MoE fields are
                 consumed via :class:`~ouroboros.moe.MoEFFN` when ``use_moe`` is
                 ``True``.
             use_moe: If ``True``, the FFN is a :class:`~ouroboros.moe.MoEFFN`
@@ -99,8 +94,7 @@ class TransformerBlock(nn.Module):
         Args:
             x: Input of shape ``(B, T, dim)``.
             freqs_cis: Precomputed RoPE frequencies sliced to the current
-                positions, sized for the active attention type
-                (``dim // n_heads`` for GQA, ``qk_rope_head_dim`` for MLA).
+                positions, sized for the GQA head width ``dim // n_heads``.
             mask: Additive causal mask of shape ``(1, 1, T, S)``, or ``None`` for
                 single-token decode. Its dtype must match the activation dtype.
             kv_cache: Optional dict mutated in place by the attention sublayer to

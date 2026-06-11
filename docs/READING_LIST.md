@@ -24,17 +24,18 @@ Read just-in-time, in lock-step with the [roadmap](./ROADMAP.md), so each paper
 lands right before you build the thing it describes:
 
 > **Phase 1 (Skeleton):** RoFormer/RoPE → RMSNorm → SwiGLU.
-> **Phase 2 (Attention):** GQA → DeepSeek-V2 (MLA) → FlashAttention-2.
+> **Phase 2 (Attention):** GQA → FlashAttention-2.
 > **Phase 3 (MoE):** DeepSeekMoE → DeepSeek-V3 (aux-loss-free bias).
 > **Phase 4 (Recurrence — the heart of the project):** Universal Transformers
 > (context) → **Parcae** (read this one closely; it is the stability thesis of the
 > whole project).
 > **Phase 5 (Full model / depth extrapolation):** Reasoning with Latent Thoughts
 > (looped-transformer theory) → COCONUT (context).
-> **Phase 7 (Inference optimization):** LLM.int8().
+> **Phase 7 (Inference optimization):** no source paper — revisit Graves (ACT) and
+> the §5 note on depth-wise batching.
 
-If you only have time for five, read in this order: **Parcae**, **DeepSeek-V2**,
-**DeepSeekMoE**, **DeepSeek-V3**, **RoFormer/RoPE**.
+If you only have time for five, read in this order: **Parcae**, **DeepSeekMoE**,
+**DeepSeek-V3**, **RoFormer/RoPE**, **GQA**.
 
 ---
 
@@ -117,10 +118,9 @@ components and back resume bullets 1 and 2.
 
 ## 2. Attention
 
-Ouroboros ships **switchable GQA / MLA** attention (`attn_type`), each with its
-own RoPE buffer, and integrates a flash-attention fast path. Maps to
-[`GQAttention`](./ARCHITECTURE.md) and [`MLAttention`](./ARCHITECTURE.md), and
-backs resume bullets 1 and 3.
+Ouroboros ships **GQA** attention with a single RoPE buffer (`freqs_cis`) and
+integrates a flash-attention fast path. Maps to
+[`GQAttention`](./ARCHITECTURE.md); backs resume bullets 1 and 3.
 
 ### GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints
 - **Authors / Year:** Ainslie et al., 2023
@@ -130,22 +130,8 @@ backs resume bullets 1 and 3.
   and multi-query by sharing each KV head across a group of query heads
   (`groups = n_heads // n_kv_heads`), and the quality/KV-cache-size trade-off
   curve. Confirms why `n_heads % n_kv_heads == 0` must hold and why GQA shrinks
-  the KV cache versus full MHA — directly relevant to the MLA-vs-GQA cache-memory
-  ablation.
-- **Priority:** **MUST-READ.**
-
-### DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model
-- **Authors / Year:** DeepSeek-AI, 2024
-- **Link:** https://arxiv.org/abs/2405.04434
-- **Maps to:** `MLAttention` (Multi-head Latent Attention).
-- **Focus on:** the **MLA** section — the compressed-KV scheme that caches a small
-  latent `c_kv` (size `kv_lora_rank`) plus a shared rotary key, instead of full
-  K/V. Trace every shape: the Q down/up path (`q_lora_rank` → split into
-  `qk_nope_head_dim` and RoPE'd `qk_rope_head_dim`), the KV down path
-  (`kv_lora_rank + qk_rope_head_dim`), and the per-step reconstruction of
-  `[k_nope | v]` from the cached latent. Note the **decoupled RoPE** detail (RoPE
-  applies only to `qk_rope_head_dim`), which is why Ouroboros precomputes a
-  separate `freqs_cis_mla` buffer. `n_kv_heads` is irrelevant under MLA.
+  the KV cache versus full MHA — directly relevant to the per-loop cost of
+  KV-cached decode (resume bullet 3).
 - **Priority:** **MUST-READ.**
 
 ### FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning
@@ -194,8 +180,8 @@ and aux-loss-free load balancing. Maps to [`MoEFFN`](./ARCHITECTURE.md) and
   `router_bias_update_rate * sign(load - mean_load)`. **Ouroboros completion:**
   many reference implementations register the bias buffer but never update it —
   we implement the update step and call it from the training loop. Read this
-  carefully; it is the concrete engineering-maturity win in
-  [DESIGN_DECISIONS](./DESIGN_DECISIONS.md) #8.
+  carefully; it is the concrete engineering-maturity win recorded in
+  [DESIGN_DECISIONS](./DESIGN_DECISIONS.md) (aux-loss-free load balancing).
 - **Priority:** **MUST-READ** (for the bias-update mechanism).
 
 ---
@@ -249,37 +235,22 @@ The dense building blocks shared across every block. Maps to
 
 ## 5. Inference Optimization
 
-The "beyond the literature" axis: INT8 quantized inference plus continuous
-depth-wise batching. Maps to [`quantize_int8` / `INT8Linear`](./ARCHITECTURE.md)
-and `generate_depthwise_batched`; backs resume bullet 3.
-
-### LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale
-- **Authors / Year:** Dettmers et al., 2022
-- **Link:** https://arxiv.org/abs/2208.07339
-- **Maps to:** `quantize_int8`, `INT8Linear`, `calibrate`,
-  `quantization_error`.
-- **Focus on:** **vector-wise / per-channel INT8 quantization** of the large
-  linear layers and the **outlier-feature** problem (why a few high-magnitude
-  feature dimensions break naive INT8 and must be handled). Map this onto our plan
-  to per-channel-quantize the big Linears (attention projections, expert FFNs)
-  while keeping norms, the router, and the (tied) LM head in higher precision, and
-  to measure the **perplexity delta** (`quantization_error`) and throughput gain.
-  T4 note: Turing has INT8 tensor cores, which is exactly why INT8 (not FP16/FP8)
-  is the chosen quantization target — see
-  [DESIGN_DECISIONS](./DESIGN_DECISIONS.md) #9.
-- **Priority:** **MUST-READ** (for resume bullet 3).
+The "beyond the literature" axis: continuous depth-wise batching. (KV-cached
+decode and the SDPA/FlashAttention-2 fast path — see §2 — are the supporting
+machinery.) Maps to `generate_depthwise_batched`; backs resume bullet 3.
 
 > **Note — continuous depth-wise batching has no single source paper.** It is the
 > inference *differentiator* of Ouroboros and is developed from first principles
-> in [ARCHITECTURE](./ARCHITECTURE.md) (component 15) and
-> [DESIGN_DECISIONS](./DESIGN_DECISIONS.md) #10. The relevant background is the
+> in [ARCHITECTURE](./ARCHITECTURE.md) (the `generate_depthwise_batched`
+> component) and [DESIGN_DECISIONS](./DESIGN_DECISIONS.md) (the depth-wise
+> batching decision). The relevant background is the
 > adaptive-computation literature above (Graves 2016; Dehghani et al. 2018) —
 > because sequences **converge** at different recurrence depths, easy ones can exit
 > the loop early while hard ones loop more *within the same batch* (Ouroboros uses a
 > non-learned `‖Δh‖ < convergence_tol` test, not a learned halting head). The
 > central engineering problem (a sequence exiting at depth `d` leaves
 > `recurrent_loop_{d..n}` KV-cache keys unpopulated) is the cache-population subtlety
-> also flagged in component 11.
+> also flagged in the `RecurrentBlock` component.
 
 ---
 
@@ -313,12 +284,10 @@ Quick lookup from each Ouroboros component to its primary references
 | `RMSNorm` | RMSNorm (Zhang & Sennrich, 2019) |
 | `RoPE` / `loop_index_embedding` | ★ RoFormer/RoPE (Su et al., 2021) |
 | `GQAttention` | ★ GQA (Ainslie et al., 2023); ★ FlashAttention-2 (Dao, 2023) |
-| `MLAttention` | ★ DeepSeek-V2 (2024) |
 | `Expert` (SwiGLU) | ★ SwiGLU (Shazeer, 2020) |
 | `MoEFFN` | ★ DeepSeekMoE (Dai et al., 2024); ★ DeepSeek-V3 (2024, bias update) |
 | `loop_index_embedding` | ★ RoFormer/RoPE (Su et al., 2021); Universal Transformers (2018, context) |
 | `LTIInjection` | ★ Parcae (Prairie et al., 2026) |
 | `RecurrentBlock` | ★ Parcae (2026); Universal Transformers (2018, context); Reasoning with Latent Thoughts (Saunshi et al., 2025) |
 | `Ouroboros` (depth extrapolation) | Reasoning with Latent Thoughts (2025); COCONUT (2024) |
-| `quantize_int8` / `INT8Linear` | ★ LLM.int8() (Dettmers et al., 2022) |
-| `generate_depthwise_batched` | (no single paper — see ARCHITECTURE component 15; adaptive-computation background above) |
+| `generate_depthwise_batched` | (no single paper — see the §5 note; adaptive-computation background above) |

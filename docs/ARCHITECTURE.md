@@ -2,13 +2,13 @@
 
 > **Ouroboros** is a recurrent-depth (looped) transformer language model built from
 > scratch in PyTorch. It follows a **Prelude → Recurrent → Coda** design with
-> fine-grained Mixture-of-Experts (routed + shared experts), switchable
-> **MLA / GQA** attention, **LTI-constrained** stable injection (spectral radius
-> `< 1` by construction), and — beyond the reference literature — **INT8**
-> post-training quantization with **continuous depth-wise batching** for inference.
+> fine-grained Mixture-of-Experts (routed + shared experts), **GQA** attention,
+> **LTI-constrained** stable injection (spectral radius `< 1` by construction),
+> and — beyond the reference literature — **continuous depth-wise batching** for
+> inference.
 
 This document is the detailed architecture reference. It opens with the canonical
-forward-pass data-flow diagram, then walks all **15 components** in dependency
+forward-pass data-flow diagram, then walks all **13 components** in dependency
 order. For each component you get: *what it is*, *why it exists* (the problem it
 solves in a looped transformer), *how it works* (math/equations, enough to
 implement without any reference repo), *exact tensor shapes & dtypes*, *key
@@ -17,8 +17,8 @@ pipeline. A **key design properties** summary table closes the document.
 
 Ouroboros is an independent implementation inspired by the published
 recurrent-depth transformer literature — primarily *Parcae* (Prairie et al.,
-2026), *DeepSeek-V2* (2024), *DeepSeekMoE* (Dai et al., 2024), *DeepSeek-V3*
-(2024), and *Universal Transformers* (Dehghani et al., 2018).
+2026), *DeepSeekMoE* (Dai et al., 2024), *DeepSeek-V3* (2024), and *Universal
+Transformers* (Dehghani et al., 2018).
 See [`READING_LIST.md`](./READING_LIST.md) for the full bibliography.
 
 **Target hardware:** a single Google Colab **T4** (16 GB VRAM, Turing `sm75`,
@@ -33,22 +33,20 @@ for this reality.
 1. [Forward-pass data flow](#1-forward-pass-data-flow)
 2. [The LTI recurrence in one line](#2-the-lti-recurrence-in-one-line)
 3. [Notation & shape conventions](#3-notation--shape-conventions)
-4. [The 15 components](#4-the-15-components)
+4. [The 13 components](#4-the-13-components)
    - [(1) OuroborosConfig](#1-ouroborosconfig--configpy)
    - [(2) RMSNorm](#2-rmsnorm--normpy)
    - [(3) RoPE](#3-rope--ropepy)
    - [(4) GQAttention](#4-gqattention--attentionpy)
-   - [(5) MLAttention](#5-mlattention--attentionpy)
-   - [(6) Expert (SwiGLU FFN)](#6-expert-swiglu-ffn--moepy)
-   - [(7) MoEFFN](#7-moeffn--moepy)
-   - [(8) TransformerBlock](#8-transformerblock--blockpy)
-   - [(9) loop_index_embedding](#9-loop_index_embedding--recurrencepy)
-   - [(10) LTIInjection](#10-ltiinjection--recurrencepy)
-   - [(11) RecurrentBlock](#11-recurrentblock--recurrencepy)
-   - [(12) Ouroboros](#12-ouroboros--modelpy)
-   - [(13) KV cache & autoregressive generation](#13-kv-cache--autoregressive-generation--modelpy)
-   - [(14) INT8 quantization](#14-int8-quantization--quantizepy)
-   - [(15) Continuous depth-wise batching](#15-continuous-depth-wise-batching--modelpy)
+   - [(5) Expert (SwiGLU FFN)](#5-expert-swiglu-ffn--moepy)
+   - [(6) MoEFFN](#6-moeffn--moepy)
+   - [(7) TransformerBlock](#7-transformerblock--blockpy)
+   - [(8) loop_index_embedding](#8-loop_index_embedding--recurrencepy)
+   - [(9) LTIInjection](#9-ltiinjection--recurrencepy)
+   - [(10) RecurrentBlock](#10-recurrentblock--recurrencepy)
+   - [(11) Ouroboros](#11-ouroboros--modelpy)
+   - [(12) KV cache & autoregressive generation](#12-kv-cache--autoregressive-generation--modelpy)
+   - [(13) Continuous depth-wise batching](#13-continuous-depth-wise-batching--modelpy)
 5. [Key design properties (summary table)](#5-key-design-properties-summary-table)
 
 ---
@@ -73,7 +71,7 @@ The canonical end-to-end data flow (spec §3). This same diagram appears in the
  │  for t in range(n_loops):                                        │
  │    h_loop   = loop_index_embedding(h, t, loop_dim)   # sinusoid  │
  │    combined = RMSNorm(h_loop + e)                                │
- │    trans    = TransformerBlock(combined, ...)  # MLA/GQA + MoE   │
+ │    trans    = TransformerBlock(combined, ...)  # GQA + MoE       │
  │    h        = LTIInjection(h, e, trans)  # h = A·h + B·e + trans │
  └──────────────────────────────────────────────────────────────────┘
       │  x := h (B, T, dim) — final hidden state after n_loops
@@ -126,7 +124,7 @@ Because `ρ(A) < 1` holds *by construction*, the homogeneous part `A · h_t` is 
 contraction: errors decay across loop iterations instead of compounding. This is
 what lets Ouroboros train at high learning rates without gradient-clipping or
 hidden-state-normalization band-aids. `ρ(A)` is the single cheapest, most
-informative stability signal in the whole system — log it every step (see §11).
+informative stability signal in the whole system — log it every step (see §9).
 
 ---
 
@@ -145,14 +143,14 @@ informative stability signal in the whole system — log it every step (see §11
 **Dtype convention.** Parameters and activations run in the autocast dtype
 (`fp16` on T4 with `GradScaler`, or `bf16` on Ampere). Two reductions are forced
 to **fp32** for numerical safety: the RMSNorm mean-of-squares (§2) and the RoPE /
-LTI computations (§3, §11). The **additive attention mask must match the
+LTI computations (§3, §9). The **additive attention mask must match the
 activation dtype** — an `fp32` mask on `fp16`/`bf16` logits silently upcasts the
 attention matrix and breaks the downstream matmul against `V` in the fallback
-path (§4 gotcha). `freqs_cis` buffers are `complex64`.
+path (§4 gotcha). The `freqs_cis` buffer is `complex64`.
 
 ---
 
-## 4. The 15 components
+## 4. The 13 components
 
 Presented in dependency order: each component only depends on those above it.
 Public signatures are quoted **verbatim** from the spec — the `.py` stubs must
@@ -167,14 +165,17 @@ match them exactly.
 component reads its dimensions from this object — there are no magic numbers
 elsewhere.
 
-**Why it exists.** A looped MoE model with two attention back-ends has a large,
-interdependent hyperparameter surface (head dims must divide, expert width is
-derived from routing, the loop-index dim is a fraction of `dim`, etc.). Centralizing
+**Why it exists.** A looped MoE model has a large, interdependent hyperparameter
+surface (head dims must divide, expert width is derived from routing, the
+loop-index dim is a fraction of `dim`, etc.). Centralizing
 these into one typed object makes the invariants checkable in one place and keeps
 the tiny-test / T4-training / frontier configs interchangeable.
 
 **How it works.** Plain dataclass with defaults targeting a small T4-friendly
-model. No methods, no logic. The canonical fields:
+model. Its only logic is `__post_init__`, which validates the cross-field
+invariants (head divisibility, even RoPE/loop-index dims, `n_experts_per_tok <=
+n_experts`) so an invalid combination fails at construction with a clear message
+instead of as a shape error deep in a forward pass. The canonical fields:
 
 ```python
 @dataclass
@@ -183,19 +184,11 @@ class OuroborosConfig:
     vocab_size: int = 8192          # small BPE vocab keeps the embedding table modest at small dim
     dim: int = 512                  # residual-stream width
     n_heads: int = 8                # query heads
-    n_kv_heads: int = 2             # GQA key/value heads (n_heads % n_kv_heads == 0); ignored by MLA
+    n_kv_heads: int = 2             # GQA key/value heads (n_heads % n_kv_heads == 0)
     max_seq_len: int = 1024         # RoPE precomputation length
     max_loop_iters: int = 8         # default recurrent depth T at inference
     prelude_layers: int = 2         # standard blocks before the loop
     coda_layers: int = 2            # standard blocks after the loop
-
-    # --- Attention ("gqa" | "mla") ---
-    attn_type: str = "gqa"          # default GQA: simpler + has the FA2 fast path
-    kv_lora_rank: int = 128         # [MLA] compressed KV latent cached
-    q_lora_rank: int = 256          # [MLA] compressed Q latent
-    qk_rope_head_dim: int = 32      # [MLA] per-head dims that receive RoPE
-    qk_nope_head_dim: int = 64      # [MLA] per-head dims without RoPE
-    v_head_dim: int = 64            # [MLA] per-head value dim
 
     # --- MoE FFN (used only inside the Recurrent Block) ---
     n_experts: int = 8              # routed experts
@@ -205,6 +198,7 @@ class OuroborosConfig:
 
     # --- Recurrence ---
     loop_index_dim: Optional[int] = None  # channels receiving loop-index embedding; None -> dim // 8
+    use_lti: bool = True            # False -> naive residual injection h = transformer_out + e (ablation)
 
     # --- Load balancing (Ouroboros completes what reference impls leave as a stub) ---
     router_bias_update_rate: float = 1e-3  # aux-loss-free LB: per-step bias nudge magnitude
@@ -222,7 +216,6 @@ asserting in tests):
 
 - `n_heads % n_kv_heads == 0` (GQA grouping must be integral).
 - `dim // n_heads` is **even** (RoPE pairs adjacent features).
-- `qk_rope_head_dim` is **even** (RoPE again).
 - Fine-grained MoE rule of thumb: `expert_dim ≈ dim // (n_experts // n_experts_per_tok)`.
 - Shared experts use a **larger** hidden width — `expert_dim * n_experts_per_tok`.
 
@@ -257,8 +250,8 @@ class RMSNorm(nn.Module):
 LayerNorm without the mean-subtraction and without a bias term.
 
 **Why it exists.** It is the normalization used *everywhere* — pre-norm in every
-TransformerBlock, on the Q and KV latents inside MLA, and on `(h_loop + e)` before
-each recurrent step. In a looped model the same RMSNorm is applied many times to
+TransformerBlock, and on `(h_loop + e)` before each recurrent step. In a looped
+model the same RMSNorm is applied many times to
 the evolving latent, so it must be cheap and numerically robust. Dropping the
 mean-subtraction (vs LayerNorm) removes one reduction and one centering op with no
 measured quality loss for decoder LMs.
@@ -347,15 +340,13 @@ an **isometry** — it preserves the L2 norm of every feature pair exactly. Posi
 - **The caller slices `freqs_cis`**, not `apply_rope`. `apply_rope` is positionless;
   the model slices `freqs_cis[start_pos : start_pos + T]` so cached decode tokens
   get the correct absolute positions. Forgetting this gives every decoded token a
-  position-0 (identity) rotation and generation degrades (see §3, §12, §13).
+  position-0 (identity) rotation and generation degrades (see §11, §12).
 - **Compute in fp32, cast back.** The complex multiply is done on `x.float()` then
   cast to `x.dtype`, mirroring RMSNorm's fp32 safety.
-- **Two differently-sized buffers exist** (one for GQA, one for MLA) — see §12,
-  component 12. GQA rotates the full `dim // n_heads`; MLA rotates only
-  `qk_rope_head_dim`.
 
-**Where it fits.** Inside both attention back-ends, applied to Q and K. The
-buffers live on the top-level `Ouroboros` module and are passed down.
+**Where it fits.** Inside the attention layer, applied to Q and K. The single
+buffer — sized to the head dim `dim // n_heads` — lives on the top-level
+`Ouroboros` module and is passed down.
 
 ---
 
@@ -371,12 +362,11 @@ class GQAttention(nn.Module):
 attention with **fewer KV heads than query heads** — each KV head is shared across
 `groups = n_heads // n_kv_heads` query heads.
 
-**Why it exists.** It is the default attention back-end (`attn_type="gqa"`):
-simpler than MLA, and — crucially — it has a **FlashAttention-2 / SDPA-flash fast
-path** that handles GQA natively. The KV cache shrinks by a factor of `groups`
-versus full MHA, which is the dominant memory cost at decode time. For a looped
-model that re-runs attention at every depth, a small KV cache and a fast kernel
-both matter.
+**Why it exists.** It is the model's one and only attention mechanism, and —
+crucially — it has a **FlashAttention-2 / SDPA-flash fast path** that handles GQA
+natively. The KV cache shrinks by a factor of `groups` versus full MHA, which is
+the dominant memory cost at decode time. For a looped model that re-runs attention
+at every depth, a small KV cache and a fast kernel both matter.
 
 **How it works.** With `head_dim = dim // n_heads`:
 
@@ -388,9 +378,11 @@ both matter.
    rotated) `k, v` onto the cached tensors along the sequence dim, store the
    `.detach()`ed result back, and reuse — so retrieval never needs re-rotation.
 4. Attention itself, via one of:
-   - **Fast path (Ampere/Hopper):** if `flash_attn_func` is importable, cast Q/K/V
-     to `bf16`, call it (it handles GQA natively, no KV-head expansion),
-     `causal=(mask is not None)`, restore the original dtype.
+   - **Fast path (Ampere/Hopper):** if `flash_attn_func` is importable, call it on
+     Q/K/V **in the input dtype** (it handles GQA natively, no KV-head expansion),
+     `causal=(mask is not None)`. No bf16 round-trip — the T4 target is fp16-only,
+     and the kernel takes fp16 directly; only fp32 inputs are cast (to fp16) and
+     restored.
    - **Fast path (T4, realistic):** `F.scaled_dot_product_attention` under
      `torch.backends.cuda.sdp_kernel(...)` selecting the flash / mem-efficient
      backend. This is the robust Turing path (see the FA2 reality note below).
@@ -415,7 +407,7 @@ along `S` across decode steps and `.detach()`ed.
 - **Mask dtype must match activation dtype.** An `fp32` mask added to `fp16`/`bf16`
   logits upcasts the attention matrix to `fp32`; the subsequent matmul against a
   `bf16` `V` in the fallback path then mismatches dtypes (or silently upcasts and
-  costs memory). Build the mask in `x.dtype` (§3, §12).
+  costs memory). Build the mask in `x.dtype` (§3, §11).
 - **FA2-on-T4 reality (surface this honestly).** FlashAttention-2's prebuilt
   wheels target Ampere `sm80`+/Hopper. On Turing (T4, `sm75`) the `flash-attn`
   package is forward-only and frequently fails to build. The realistic, robust
@@ -425,94 +417,14 @@ along `S` across decode steps and `.detach()`ed.
 - **Cache *after* RoPE**, not before — otherwise every retrieval would have to
   re-rotate the entire cached history.
 
-**Where it fits.** Selected inside every `TransformerBlock` when
-`attn_type == "gqa"` — i.e. in Prelude, Recurrent, and Coda. The `flash_attn`
-import is guarded: `try: from flash_attn import flash_attn_func; _HAS_FLASH_ATTN
-= True / except ImportError: _HAS_FLASH_ATTN = False`.
+**Where it fits.** Inside every `TransformerBlock` — Prelude, Recurrent, and
+Coda. The `flash_attn` import is guarded: `try: from flash_attn import
+flash_attn_func; _HAS_FLASH_ATTN = True / except ImportError: _HAS_FLASH_ATTN =
+False`.
 
 ---
 
-### (5) `MLAttention` — `attention.py`
-
-```python
-class MLAttention(nn.Module):
-    def __init__(self, cfg: OuroborosConfig): ...
-    def forward(self, x, freqs_cis, mask=None, kv_cache=None, cache_key="default"): ...
-```
-
-**What it is.** Multi-Latent Attention (DeepSeek-V2, 2024). Instead of caching
-full `K` and `V` per token, MLA caches a **low-rank latent** `c_kv` and a small
-shared RoPE key, reconstructing `K_nope` and `V` on the fly each step.
-
-**Why it exists.** It is the alternative attention back-end (`attn_type="mla"`).
-The KV cache is the dominant decode-time memory cost; MLA compresses it
-dramatically (caching `kv_lora_rank + qk_rope_head_dim` per token instead of
-`n_kv_heads · head_dim · 2`). On a 16 GB T4 this directly extends the feasible
-context length and batch size. Switchability (GQA ↔ MLA via one config flag) is
-itself a portfolio talking point — see [`DESIGN_DECISIONS.md`](./DESIGN_DECISIONS.md#4).
-
-**How it works.** Per-head query dim is `q_head_dim = qk_nope_head_dim +
-qk_rope_head_dim`.
-
-*Q path (decoupled RoPE):*
-```
- x → q_down (dim → q_lora_rank) → q_norm (RMSNorm)
-   → q_up_nope (q_lora_rank → H·qk_nope_head_dim)   # no RoPE
-   → q_up_rope (q_lora_rank → H·qk_rope_head_dim)   # RoPE applied
- q = concat(q_nope, q_rope)  per head               # (B, T, H, q_head_dim)
-```
-
-*KV path (compressed, decoupled RoPE):*
-```
- x → kv_down (dim → kv_lora_rank + qk_rope_head_dim)
-   splits into:
-     c_kv       (B, T, kv_lora_rank)         ← CACHED (the latent)
-     k_rope_raw (B, T, qk_rope_head_dim)     ← shared across heads
- k_rope = RoPE( expand_to_heads(k_rope_raw) )        # (B, T, H, qk_rope_head_dim) ← CACHED, already rotated
- # reconstructed every step (NOT cached):
- c_kv → kv_norm (RMSNorm) → kv_up (kv_lora_rank → H·(qk_nope_head_dim + v_head_dim))
-        → split into k_nope (B, S, H, qk_nope_head_dim) and v (B, S, H, v_head_dim)
- k = concat(k_nope, k_rope)  per head                # (B, S, H, q_head_dim)
-```
-
-Then scaled dot-product attention `softmax(QKᵀ / √q_head_dim + mask) · V`, and the
-output projection `wo: n_heads·v_head_dim → dim`.
-
-**Inputs / outputs.**
-
-| Tensor      | Shape                                | Notes                                      |
-| ----------- | ------------------------------------ | ------------------------------------------ |
-| `x`         | `(B, T, dim)`                        | input                                      |
-| `freqs_cis` | `(T, qk_rope_head_dim/2)` `complex64`| **MLA-sized** RoPE buffer                  |
-| `mask`      | `(1, 1, T, S)` or `None`             | additive; matches activation dtype         |
-| `kv_cache`  | `dict` or `None`                     | see below                                  |
-| out         | `(B, T, dim)`                        | —                                          |
-
-KV cache entry:
-`{cache_key: {"c_kv": (B, S, kv_lora_rank), "k_rope": (B, S, H, qk_rope_head_dim)}}`
-— far smaller than GQA's full `K`/`V`.
-
-**Gotchas.**
-
-- **`n_kv_heads` is irrelevant to MLA** — it is a GQA-only knob. With
-  `attn_type="mla"` the config's `n_kv_heads` is simply ignored.
-- **MLA needs its own RoPE buffer** sized to `qk_rope_head_dim`, separate from the
-  GQA buffer sized to `dim // n_heads`. The model precomputes both (§12, gotcha 2).
-- **`k_rope` is shared across heads** (computed once from `k_rope_raw`, then
-  expanded), and it is cached **already rotated** — like GQA, retrieval needs no
-  re-rotation. `c_kv` is cached **unrotated** because `K_nope` carries no
-  positional signal.
-- **MLA has no flash fast path here.** Because `K`/`V` are reconstructed each step
-  and the decoupled-RoPE layout differs from the standard one, MLA uses the manual
-  SDPA path. (A fused MLA kernel is future work.)
-
-**Where it fits.** Selected inside every `TransformerBlock` when
-`attn_type == "mla"` — Prelude, Recurrent, and Coda. Compared head-to-head against
-GQA in [`EXPERIMENTS.md`](./EXPERIMENTS.md) (experiment 2).
-
----
-
-### (6) Expert (SwiGLU FFN) — `moe.py`
+### (5) Expert (SwiGLU FFN) — `moe.py`
 
 ```python
 class Expert(nn.Module):
@@ -552,7 +464,7 @@ block's MoE (routed: `expert_dim`; shared: `expert_dim · n_experts_per_tok`).
 
 ---
 
-### (7) `MoEFFN` — `moe.py`
+### (6) `MoEFFN` — `moe.py`
 
 ```python
 class MoEFFN(nn.Module):
@@ -600,7 +512,7 @@ no tug-of-war between LM loss and balance loss).
 - `router_bias` is a **non-gradient buffer** (`register_buffer`), shape `(n_experts,)`.
 - Routed experts: `n_experts × Expert(dim, expert_dim)`.
 - Shared experts: `n_shared_experts × Expert(dim, expert_dim · n_experts_per_tok)`
-  (wider, as noted in component 6).
+  (wider, as noted in component 5).
 
 *`update_router_bias()` — the Ouroboros completion.* Naive reference
 implementations register the bias buffer but **never update it**, leaving load
@@ -638,7 +550,7 @@ dense `Expert`. `update_router_bias()` is driven by the training loop (Phase 6).
 
 ---
 
-### (8) `TransformerBlock` — `block.py`
+### (7) `TransformerBlock` — `block.py`
 
 ```python
 class TransformerBlock(nn.Module):
@@ -646,14 +558,13 @@ class TransformerBlock(nn.Module):
     def forward(self, x, freqs_cis, mask=None, kv_cache=None, cache_key="default"): ...
 ```
 
-**What it is.** A standard **pre-norm** transformer block with a swappable
-attention back-end and a swappable FFN.
+**What it is.** A standard **pre-norm** transformer block with GQA attention and
+a swappable FFN.
 
 **Why it exists.** It is the single reusable layer primitive. The *same* class
 serves the dense Prelude/Coda layers (`use_moe=False`) and the looped Recurrent
-core (`use_moe=True`), and it transparently picks GQA or MLA from `cfg.attn_type`.
-One block definition, used everywhere, keeps the architecture honest and the cache
-plumbing uniform.
+core (`use_moe=True`). One block definition, used everywhere, keeps the
+architecture honest and the cache plumbing uniform.
 
 **How it works.** Pre-norm residual structure:
 
@@ -662,13 +573,13 @@ plumbing uniform.
  x = x + dropout( ffn(  RMSNorm(x) ) )
 ```
 
-- `attn = MLAttention(cfg) if attn_type == "mla" else GQAttention(cfg)`.
+- `attn = GQAttention(cfg)`.
 - `ffn  = MoEFFN(cfg) if use_moe else Expert(dim, dim * 4 // 3)`.
 - Two independent `RMSNorm`s (one before attention, one before the FFN).
 - `cache_key` and `kv_cache` are threaded straight to the attention layer.
 
 **Inputs / outputs.** `x: (B, T, dim) → (B, T, dim)`; same `freqs_cis` / `mask` /
-`kv_cache` / `cache_key` contract as the attention layers it wraps.
+`kv_cache` / `cache_key` contract as the attention layer it wraps.
 
 **Gotcha.** `use_moe=True` is used **only** inside `RecurrentBlock`. Prelude and
 Coda always pass `use_moe=False`. The MoE's `update_router_bias` therefore only
@@ -679,7 +590,7 @@ one instance inside `RecurrentBlock` (MoE), `coda_layers` instances (dense).
 
 ---
 
-### (9) `loop_index_embedding` — `recurrence.py`
+### (8) `loop_index_embedding` — `recurrence.py`
 
 ```python
 def loop_index_embedding(h, loop_t: int, loop_dim: int, theta: float = 10000.0) -> torch.Tensor:
@@ -715,7 +626,7 @@ and `loop_dim` are Python ints.
 - **Only the first `loop_dim` channels change** — the rest are untouched, by
   design. This keeps the bulk of the residual stream free for content.
 - `loop_dim` must be even (it indexes sin/cos pairs). It defaults to `dim // 8` via
-  `cfg.loop_index_dim` (see component 11).
+  `cfg.loop_index_dim` (see component 10).
 - It is a **sinusoidal** embedding, chosen over a learned per-loop table on purpose
   — sinusoids extrapolate to loop counts beyond training (depth extrapolation; see
   [`DESIGN_DECISIONS.md`](./DESIGN_DECISIONS.md#6)).
@@ -725,7 +636,7 @@ before it is combined with `e` and normalized.
 
 ---
 
-### (10) `LTIInjection` — `recurrence.py`
+### (9) `LTIInjection` — `recurrence.py`
 
 ```python
 class LTIInjection(nn.Module):
@@ -792,7 +703,8 @@ The update rule:
   that is where the `0 · ∞` lurks.
 - **`ρ(A) = max(get_A())`** because `A` is diagonal. This is the cheap, continuous
   stability scalar — log it every training step to W&B (spec §5.10). The
-  centerpiece stability experiment (LTI vs no-LTI) plots `ρ(A)` and loss together
+  centerpiece stability experiment (LTI vs no-LTI, toggled by `cfg.use_lti`) plots
+  `ρ(A)` and loss together
   (see [`EXPERIMENTS.md`](./EXPERIMENTS.md), experiment 1).
 
 **Where it fits.** The recurrence's update step:
@@ -801,7 +713,7 @@ transformer output is available.
 
 ---
 
-### (11) `RecurrentBlock` — `recurrence.py`
+### (10) `RecurrentBlock` — `recurrence.py`
 
 ```python
 class RecurrentBlock(nn.Module):
@@ -814,7 +726,7 @@ MoE) run for a fixed `n_loops` iterations, wrapped in loop-index conditioning an
 LTI injection. This is where the entire architecture's identity lives.
 
 **Why it exists.** It implements "same weights, more loops → deeper reasoning, no
-parameter growth." The recurrence machinery (components 9–10) is orchestrated here
+parameter growth." The recurrence machinery (components 8–9) is orchestrated here
 into the canonical loop body from §1.
 
 **How it works — owned submodules.**
@@ -824,6 +736,7 @@ self.block     = TransformerBlock(cfg, use_moe=True)
 self.injection = LTIInjection(cfg.dim)
 self.norm      = RMSNorm(cfg.dim)
 self.loop_dim  = cfg.loop_index_dim or cfg.dim // 8
+self.use_lti   = cfg.use_lti
 ```
 
 **Loop body** (per iteration `t = 0 … n_loops−1`, fixed depth, no early exit):
@@ -832,9 +745,15 @@ self.loop_dim  = cfg.loop_index_dim or cfg.dim // 8
  h_loop   = loop_index_embedding(h, t, loop_dim)              # depth signal
  combined = norm(h_loop + e)                                   # re-read frozen input
  trans    = block(combined, freqs_cis, mask, kv_cache,
-                  cache_key=f"recurrent_loop_{t}")             # MLA/GQA + MoE
+                  cache_key=f"recurrent_loop_{t}")             # GQA + MoE
  h        = injection(h, e, trans)                             # h = A·h + B·e + trans
 ```
+
+With `use_lti=False` the injection step is replaced by a naive residual injection
+`h = trans + e` — the no-LTI arm of the stability experiment (see
+[`EXPERIMENTS.md`](./EXPERIMENTS.md), experiment 1). Everything else in the loop
+body is identical, so any stability difference is attributable to the LTI update
+alone.
 
 After `n_loops` iterations the final hidden state `h` is returned. The loop runs a
 **fixed** number of iterations for every position — there is no adaptive halting,
@@ -846,9 +765,9 @@ count is preferred over adaptive halting at this scope.
 
 | Tensor      | Shape                              | Notes                                  |
 | ----------- | ---------------------------------- | -------------------------------------- |
-| `h`         | `(B, T, dim)`                      | initial state (= Prelude output)       |
+| `h`         | `(B, T, dim)`                      | initial state `h_0 = e` (Prelude output) |
 | `e`         | `(B, T, dim)`                      | frozen encoded input                   |
-| `freqs_cis` | `(T, rope/2)` `complex64`          | GQA- or MLA-sized, selected upstream   |
+| `freqs_cis` | `(T, head_dim/2)` `complex64`      | sliced upstream by `start_pos`         |
 | `mask`      | `(1, 1, T, S)` or `None`           | additive, activation dtype             |
 | `n_loops`   | `int` or `None` (→ `max_loop_iters`)| recurrent depth                       |
 | `kv_cache`  | `dict` or `None`                   | distinct key per loop depth            |
@@ -862,7 +781,7 @@ count is preferred over adaptive halting at this scope.
   forward pass runs all `n_loops` depths, a cache is populated at every
   `recurrent_loop_{t}` key, so later decode steps always find the keys they need.
   Per-sequence early exit — used only by inference-time continuous depth-wise
-  batching — is handled separately in component 15, where its cache implications
+  batching — is handled separately in component 13, where its cache implications
   are addressed.
 - **`e` is re-read every loop** (inside `norm(h_loop + e)` *and* in the LTI `B·e`
   term) — it is the anti-drift anchor that keeps the prompt alive across arbitrary
@@ -873,7 +792,7 @@ receives `h = e = (Prelude output)` and returns the latent fed to the Coda.
 
 ---
 
-### (12) `Ouroboros` — `model.py`
+### (11) `Ouroboros` — `model.py`
 
 ```python
 class Ouroboros(nn.Module):
@@ -886,14 +805,14 @@ class Ouroboros(nn.Module):
     def generate(self, input_ids, max_new_tokens=64, n_loops=8, temperature=1.0, top_k=50): ...
     @torch.no_grad()
     def generate_depthwise_batched(self, input_ids, max_new_tokens=64, max_loops=None,
-                                   convergence_tol=1e-3, temperature=1.0, top_k=50): ...  # Phase 7, see (15)
+                                   convergence_tol=1e-3, temperature=1.0, top_k=50): ...  # Phase 7, see (13)
 ```
 
 **What it is.** The full top-level model: `Embedding → Prelude → RecurrentBlock →
 Coda → RMSNorm → tied LM head`, plus generation entry points.
 
-**Why it exists.** It wires the 11 components above into the end-to-end forward
-pass of §1, owns the two RoPE buffers, the embedding/head weight tying, weight
+**Why it exists.** It wires the 10 components above into the end-to-end forward
+pass of §1, owns the RoPE buffer, the embedding/head weight tying, weight
 init, and the causal mask — i.e. everything that is global to the architecture
 rather than local to a layer.
 
@@ -901,9 +820,7 @@ rather than local to a layer.
 
 ```python
 self.embed      = nn.Embedding(vocab_size, dim)
-# TWO RoPE buffers (gotcha 2):
-self.freqs_cis     = precompute_rope_freqs(dim // n_heads,      max_seq_len, rope_theta)  # GQA-sized
-self.freqs_cis_mla = precompute_rope_freqs(qk_rope_head_dim,    max_seq_len, rope_theta)  # MLA-sized
+self.freqs_cis  = precompute_rope_freqs(dim // n_heads, max_seq_len, rope_theta)  # head-dim sized
 self.prelude    = ModuleList([TransformerBlock(cfg, use_moe=False) for _ in range(prelude_layers)])
 self.recurrent  = RecurrentBlock(cfg)
 self.coda       = ModuleList([TransformerBlock(cfg, use_moe=False) for _ in range(coda_layers)])
@@ -917,11 +834,11 @@ self._init_weights()                    # N(0, init_std) on Linear & Embedding
 
 ```
  x         = embed(input_ids)                                  # (B, T, dim)
- freqs_cis = (freqs_cis_mla if attn_type=="mla" else freqs_cis)[start_pos : start_pos + T]
+ freqs_cis = freqs_cis[start_pos : start_pos + T]              # absolute positions
  mask      = _causal_mask(T, device, x.dtype) if T > 1 else None   # decode (T=1) needs no mask
  for i, layer in enumerate(prelude):  x = layer(x, freqs_cis, mask, kv_cache, f"prelude_{i}")
  e = x                                                          # freeze encoded input
- x = recurrent(x, e, freqs_cis, mask, n_loops, kv_cache)
+ x = recurrent(x, e, freqs_cis, mask, n_loops, kv_cache)        # h_0 = e
  for i, layer in enumerate(coda):     x = layer(x, freqs_cis, mask, kv_cache, f"coda_{i}")
  return head(norm(x))                                          # (B, T, vocab_size)
 ```
@@ -946,23 +863,20 @@ on/below the diagonal, `-inf` above (`torch.triu(full(-inf), diagonal=1)`),
    tokens get position-0 rotations and generation degrades. Prefill uses
    `start_pos=0`; each subsequent decode step passes only the last token with
    `start_pos = prompt_len + step − 1`. (Spec §5.3.)
-2. **Dual RoPE buffers.** GQA rotates the full `dim // n_heads`; MLA rotates only
-   `qk_rope_head_dim`. The model precomputes **both** and selects per `attn_type`
-   at forward. Mixing them up silently breaks one back-end. (Spec §5.2.)
-3. **Mask only when `T > 1`.** Single-token decode (`T=1`) needs no causal mask;
-   building one would be wrong shape-wise against the cached `S`. (See §13.)
-4. **Weight init ignores residual-depth scaling (improvement note).** Naive
+2. **Mask only when `T > 1`.** Single-token decode (`T=1`) needs no causal mask;
+   building one would be wrong shape-wise against the cached `S`. (See §12.)
+3. **Weight init ignores residual-depth scaling (improvement note).** Naive
    `N(0, init_std)` on all weights does not account for the variance a *looped*
    model accumulates across loops. Document GPT-2-style `1/√(2·n_eff)` scaling on
    residual output projections (and optionally QK-norm / logit z-loss) as a
-   stability improvement to ablate (spec §5.9, §12 init note).
+   stability improvement to ablate (spec §5.9, §11 init note).
 
 **Where it fits.** It *is* the model — Prelude, Recurrent, and Coda all hang off
 it, and it owns everything global.
 
 ---
 
-### (13) KV cache & autoregressive generation — `model.py`
+### (12) KV cache & autoregressive generation — `model.py`
 
 *(Covered by `forward` and `generate` above; this section makes the caching
 contract explicit.)*
@@ -980,8 +894,8 @@ token's contribution each step.
 - The cache is a plain `dict` **mutated in place**; pass `{}` and reuse it across
   decode steps. Deterministic keys (`prelude_{i}`, `recurrent_loop_{t}`,
   `coda_{i}`) guarantee caches never collide across layers or loop depths.
-- **GQA** caches `{"k", "v"}`; **MLA** caches the much smaller compressed latent
-  `{"c_kv", "k_rope"}`.
+- Each entry holds `{"k", "v"}` — grouped KV heads, stored **already rotated**
+  (component 4), so retrieval never re-rotates.
 - `generate`:
   - **Step 0** processes the *full prompt* (`start_pos=0`, builds the causal mask).
   - **Each later step** passes only the last token (`input_ids[:, -1:]`, `T=1`)
@@ -995,15 +909,15 @@ token's contribution each step.
 
 **Gotchas.**
 
-- **`start_pos` is load-bearing** (see §12 gotcha 1).
+- **`start_pos` is load-bearing** (see §11 gotcha 1).
 - **A correctness invariant worth a test:** cached single-token decode logits must
   match a full-context forward pass over the same sequence (within numerical
   tolerance). This is the canonical KV-cache regression test (Phase 5 / Phase 6).
-- **The fixed-depth recurrent loop keeps caching simple** (§11) — every
+- **The fixed-depth recurrent loop keeps caching simple** (§10) — every
   `recurrent_loop_{t}` key is populated on every forward, so the standard
   `generate` path has no cache/recurrence edge case. Per-sequence early exit is
   introduced only by continuous depth-wise batching, which handles its own cache
-  implications (§15).
+  implications (§13).
 
 **Where it fits.** Spans all three stages (every layer/loop writes to the same
 cache dict). Lives on the model; exercised by `generate` and
@@ -1011,62 +925,7 @@ cache dict). Lives on the model; exercised by `generate` and
 
 ---
 
-### (14) INT8 quantization — `quantize.py`
-
-```python
-def quantize_int8(model: "Ouroboros", method: str = "dynamic") -> "Ouroboros": ...
-
-class INT8Linear(nn.Module):
-    def __init__(self, linear: nn.Linear): ...
-    def forward(self, x: torch.Tensor) -> torch.Tensor: ...
-
-def calibrate(model, calibration_loader) -> None: ...        # for static PTQ
-
-def quantization_error(fp_model, int8_model, eval_loader) -> dict: ...   # ppl delta, etc.
-```
-
-**What it is.** Post-training INT8 quantization for **inference only** — one half
-of the "beyond the literature" differentiator (resume bullet 3). Replaces the big
-`nn.Linear` layers with INT8-weighted equivalents (`INT8Linear`).
-
-**Why it exists.** Memory and throughput. The T4 has **INT8 tensor cores**, so
-8-bit weights cut memory roughly in half *and* can run faster than FP16 on
-matmul-bound layers — directly feeding the throughput multiplier in resume bullet
-3. The architectural cost is measured (perplexity delta), not assumed.
-
-**How it works.**
-
-- **Per-channel weight quantization** of the big linears: attention projections
-  (`wq/wk/wv/wo`, MLA's down/up projections) and the expert FFNs. **Keep in higher
-  precision:** RMSNorm weights, the router, and the tied LM head — these are small,
-  sensitive, and cheap to leave in FP16.
-- `INT8Linear` wraps an existing `nn.Linear`, storing INT8 weights + per-channel
-  scales and dequantizing/computing in the forward pass.
-- `method`: `"dynamic"` (activations quantized per-batch at runtime — simplest,
-  no calibration) or `"static"` (activation ranges fixed ahead of time via
-  `calibrate`). Backends: `torch.ao.quantization` (dynamic/static) or
-  `bitsandbytes` Int8 linear.
-- `quantization_error(fp_model, int8_model, eval_loader)` reports the perplexity
-  delta (and related metrics) so the accuracy cost is on record.
-
-**Inputs / outputs.** `quantize_int8(model) → model` (an Ouroboros with INT8
-linears swapped in). `quantization_error(...) → dict` of metrics.
-
-**Gotchas.**
-
-- **Do not quantize norms / router / LM head** — small layers with outsized
-  sensitivity; quantizing them hurts perplexity for negligible savings.
-- **Pick the realistic backend.** Document the actual choice (`torch.ao` vs
-  `bitsandbytes`) and the T4 INT8-tensor-core caveat — measured, not assumed.
-- **It is inference-only** — no gradients flow through INT8 weights here.
-
-**Where it fits.** Applied to a *trained* `Ouroboros` (Phase 7), orthogonal to the
-forward-pass structure: it swaps layer internals across all three stages without
-changing the data flow.
-
----
-
-### (15) Continuous depth-wise batching — `model.py`
+### (13) Continuous depth-wise batching — `model.py`
 
 ```python
 @torch.no_grad()
@@ -1074,20 +933,29 @@ def generate_depthwise_batched(self, input_ids, max_new_tokens=64, max_loops=Non
                                convergence_tol=1e-3, temperature=1.0, top_k=50): ...
 ```
 
-**What it is.** **THE** inference differentiator (the other half of resume bullet
-3). Because all sequences share the same recurrent weights, different sequences in
+**What it is.** **THE** inference differentiator (resume bullet 3). Because all
+sequences share the same recurrent weights, different sequences in
 one batch can **exit the loop at different depths** via a non-learned, *convergence
 based* early-exit: a sequence stops looping once its hidden state stops changing
-(`‖h_{t+1} − h_t‖ < convergence_tol`). Easy sequences converge fast and exit early,
-hard ones loop deeper — all in a single batch — instead of every sequence paying
-the maximum depth. (No learned halting head; this is the cut-scope replacement for
-adaptive halting — see [`DESIGN_DECISIONS.md`](./DESIGN_DECISIONS.md#5).)
+(`‖h_{t+1} − h_t‖_F / (‖h_t‖_F + 1e-8) < convergence_tol`, Frobenius norm over
+that sequence's `(T, dim)` hidden block). The **relative** form is scale-free — a
+raw L2 norm would grow with `√(T · dim)` — so the `1e-3` default is a meaningful
+"0.1% change per iteration" criterion at every model size. Easy sequences converge
+fast and exit early, hard ones loop deeper — all in a single batch — instead of
+every sequence paying the maximum depth. (No learned halting head; this is the
+cut-scope replacement for adaptive halting — see
+[`DESIGN_DECISIONS.md`](./DESIGN_DECISIONS.md#5).)
 
 **Why it exists.** With a uniform fixed loop count, the whole batch runs to
 `max_loops` even if most sequences converged early — wasted compute proportional to
 the gap between mean and max convergence depth. Continuous depth-wise batching
 tightens that to the *active* depth, tying throughput directly to the
-convergence-depth distribution.
+convergence-depth distribution. It also carries the inference-optimization claim
+on its own: KV-cached decode (component 12) and the SDPA flash/mem-efficient fast
+path (component 4) make each decode step cheap; depth-wise batching cuts how many
+loop depths each step pays for. (Quantization is deliberately out of scope: at the
+10–30M-param scale the fp16 model is ~40 MB, so INT8 has no honest memory/latency
+story.)
 
 **How it works — and the central challenge.** The hard part is the
 **KV-cache ⊗ early-exit interaction**. A sequence that converges and exits at depth
@@ -1110,12 +978,14 @@ standard KV-cache path are reused verbatim. Options 2–3 are future optimizatio
 
 **Inputs / outputs.** `generate_depthwise_batched(input_ids (B, T)) →
 (B, T + max_new_tokens)` `long`. `max_loops` caps the deepest any sequence may run;
-`convergence_tol` sets the per-sequence early-exit threshold.
+`convergence_tol` sets the per-sequence relative-change exit threshold.
 
-**Throughput expectation.** Literature suggests ~**2–3×** depending on the
+**Throughput expectation.** The headline multiplier is **depth-wise batched decode
+vs naive fixed-depth decode** (same model, same prompts), with KV-cache on/off as
+the supporting ablation. Literature suggests ~**2–3×** depending on the
 convergence-depth distribution; the *measured* number on T4 fills in resume bullet
 3. Tie the result back to the observed convergence-depth histogram (see
-[`EXPERIMENTS.md`](./EXPERIMENTS.md), experiment 5).
+[`EXPERIMENTS.md`](./EXPERIMENTS.md), experiment 3).
 
 **Where it fits.** An inference-time orchestration over the Recurrent stage,
 implemented on the model (Phase 7). It does not change the math of any component —
@@ -1128,19 +998,18 @@ invariant above.
 
 | Property                          | Component(s)                  | Mechanism                                                            | Why it matters                                                                  |
 | --------------------------------- | ----------------------------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| **Stable looped training**        | LTIInjection (10)             | Diagonal `A` via ZOH, `ρ(A) < 1` by construction; log-space clamp `(-20,20)` | Converges at high LR with no clipping/normalization band-aids (resume bullet 2) |
-| **Depth = compute, not params**   | RecurrentBlock (11)           | One shared block looped a fixed `n_loops` times                     | Deeper reasoning with zero parameter growth                                     |
-| **Depth extrapolation**           | RecurrentBlock (11), loop-index (9) | Sinusoidal depth signal, well-defined at any loop count       | Train at `n_loops=8`, run deeper at inference                                   |
-| **Breadth in the loop**           | MoEFFN (7), Expert (6)        | Fine-grained routed + always-on shared experts                      | Large capacity, sparse top-K compute, no per-domain bottleneck                  |
-| **Real load balancing**           | MoEFFN.update_router_bias (7) | Aux-loss-free bias nudged `-= rate·sign(load−mean)` each step        | Balanced experts without an auxiliary loss; closes the reference-impl stub gap  |
-| **Switchable attention**          | GQAttention (4), MLAttention (5) | `attn_type` flag; dual RoPE buffers                              | GQA (FA2 fast path) ↔ MLA (compressed KV cache) without code changes            |
-| **Cheap decode memory**           | MLAttention (5), KV cache (13)| Cache compressed `c_kv` + shared `k_rope` (MLA) / grouped KV (GQA)  | Longer context & larger batch on a 16 GB T4                                      |
-| **Anti-drift recurrence**         | LTIInjection (10), RecurrentBlock (11) | `B·e` + `norm(h_loop+e)` re-inject frozen input every loop  | Prompt stays alive across arbitrary depth                                       |
+| **Stable looped training**        | LTIInjection (9)              | Diagonal `A` via ZOH, `ρ(A) < 1` by construction; log-space clamp `(-20,20)` | Converges at high LR with no clipping/normalization band-aids (resume bullet 2) |
+| **Depth = compute, not params**   | RecurrentBlock (10)           | One shared block looped a fixed `n_loops` times                     | Deeper reasoning with zero parameter growth                                     |
+| **Depth extrapolation**           | RecurrentBlock (10), loop-index (8) | Sinusoidal depth signal, well-defined at any loop count       | Train at `n_loops=8`, run deeper at inference                                   |
+| **Breadth in the loop**           | MoEFFN (6), Expert (5)        | Fine-grained routed + always-on shared experts                      | Large capacity, sparse top-K compute, no per-domain bottleneck                  |
+| **Real load balancing**           | MoEFFN.update_router_bias (6) | Aux-loss-free bias nudged `-= rate·sign(load−mean)` each step        | Balanced experts without an auxiliary loss; closes the reference-impl stub gap  |
+| **Cheap decode memory**           | GQAttention (4), KV cache (12)| Grouped KV heads — cache shrinks `n_heads // n_kv_heads`× vs MHA    | Longer context & larger batch on a 16 GB T4                                      |
+| **Anti-drift recurrence**         | LTIInjection (9), RecurrentBlock (10) | `B·e` + `norm(h_loop+e)` re-inject frozen input every loop  | Prompt stays alive across arbitrary depth                                       |
 | **No learned position table**     | RoPE (3)                      | Complex-phasor rotation, norm-preserving isometry                   | Relative positions, clean extrapolation, zero position params                   |
-| **Inference throughput**          | INT8 (14), depth-wise batching (15) | Per-channel INT8 weights + per-sequence convergence early exit | Memory ↓ + ~2–3× throughput on T4 (resume bullet 3)                            |
-| **Correctness under caching**     | RecurrentBlock (11), gen (13/15) | Fixed-depth loop populates every cache key; deterministic keys   | Cached decode matches full-context forward                                      |
-| **fp16 numerical safety**         | RMSNorm (2), RoPE (3), LTI (10) | fp32 reductions; dtype-matched additive mask                       | Stable training/inference in fp16 on Turing                                     |
-| **Small-scale parameter economy** | OuroborosConfig (1), Expert (6) | `vocab_size=8192`, tied embeddings, `dim*4//3` dense FFN            | Keeps the budget on the transformer, not a giant lookup table (T4-realistic)    |
+| **Inference throughput**          | GQAttention (4), KV cache (12), depth-wise batching (13) | KV-cached decode + SDPA fast path + per-sequence convergence early exit | ~2–3× over naive fixed-depth decode on T4 (resume bullet 3)                     |
+| **Correctness under caching**     | RecurrentBlock (10), gen (12/13) | Fixed-depth loop populates every cache key; deterministic keys   | Cached decode matches full-context forward                                      |
+| **fp16 numerical safety**         | RMSNorm (2), RoPE (3), LTI (9) | fp32 reductions; dtype-matched additive mask                       | Stable training/inference in fp16 on Turing                                     |
+| **Small-scale parameter economy** | OuroborosConfig (1), Expert (5) | `vocab_size=8192`, tied embeddings, `dim*4//3` dense FFN            | Keeps the budget on the transformer, not a giant lookup table (T4-realistic)    |
 
 ---
 

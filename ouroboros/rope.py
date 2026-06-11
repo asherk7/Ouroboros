@@ -5,12 +5,9 @@ applied to query and key vectors, so that attention logits depend only on the
 *relative* offset between tokens. Ouroboros precomputes the rotation phasors once
 (at model build time) and reuses them across every attention call.
 
-Because GQA and MLA rotate different per-head widths, the model precomputes **two**
-frequency buffers: one sized ``dim // n_heads`` for :class:`~ouroboros.attention.GQAttention`
-and one sized ``qk_rope_head_dim`` for the decoupled RoPE keys of
-:class:`~ouroboros.attention.MLAttention`. The model selects the appropriate buffer
-per ``attn_type`` and slices it to the current positions before calling
-:func:`apply_rope`.
+The model precomputes a single frequency buffer sized ``dim // n_heads`` (the
+per-head width rotated by :class:`~ouroboros.attention.GQAttention`) and slices
+it to the current positions before calling :func:`apply_rope`.
 
 This module exposes two functions:
 
@@ -35,8 +32,8 @@ def precompute_rope_freqs(
 
     Args:
         dim: Per-head feature dimension to rotate over (**must be even**); the
-            table holds ``dim // 2`` frequency pairs. For GQA pass
-            ``dim // n_heads``; for MLA pass ``qk_rope_head_dim``.
+            table holds ``dim // 2`` frequency pairs. The model passes
+            ``dim // n_heads``, the GQA per-head width.
         max_len: Number of positions to precompute (typically
             ``OuroborosConfig.max_seq_len``). Positions are ``0 .. max_len - 1``.
         theta: RoPE base frequency. Larger values decay the frequencies more

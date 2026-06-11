@@ -18,9 +18,7 @@ tqdm                  # progress bars for training/benchmark loops
 # --- Testing ---
 pytest                # unit + integration test suite
 
-# --- Optional fast paths (install manually; NOT required on T4) ---
+# --- Optional fast path (install manually; NOT required on T4) ---
 # flash-attn          # FlashAttention-2 native kernel — Ampere (sm80)+ only;
 #                     # forward-only and often fails to build on Turing (T4).
 #                     # On T4 the SDPA flash backend is the realistic path.
-# bitsandbytes        # INT8 linear layers for quantized inference (Phase 7);
-#                     # alternative to torch.ao.quantization.
