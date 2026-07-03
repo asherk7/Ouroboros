@@ -1,4 +1,4 @@
-# Ouroboros
+# Ouroboros (work in progress)
 
 **A recurrent-depth (looped) transformer in PyTorch — a Prelude / Recurrent / Coda design with fine-grained MoE, GQA attention, and LTI-constrained stable looping.**
 
