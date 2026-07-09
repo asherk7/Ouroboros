@@ -1,5 +1,7 @@
 # Ouroboros (work in progress)
 
+## small update, this is being put on hold till september, so i can wrap up my research with algoverse :p
+
 **A recurrent-depth (looped) transformer in PyTorch — a Prelude / Recurrent / Coda design with fine-grained MoE, GQA attention, and LTI-constrained stable looping.**
 
 Ouroboros is a recurrent-depth transformer (RDT): instead of stacking more unique
