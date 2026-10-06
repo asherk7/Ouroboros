@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ouroboros"
 version = "0.1.0"
-description = "A recurrent-depth (looped) transformer implemented from scratch in PyTorch — Prelude/Recurrent/Coda with fine-grained MoE, GQA attention, and LTI-constrained stable looping."
+description = "A recurrent-depth (looped) transformer written from scratch in PyTorch, as a learning project: Prelude/Recurrent/Coda with LTI-stable looping, GQA, KV cache, and fine-grained MoE."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -35,14 +35,12 @@ dependencies = [
     "tokenizers",
     "wandb",
     "tqdm",
+    "matplotlib",
 ]
 
 [project.optional-dependencies]
 # Development / testing.
 dev = ["pytest", "ruff", "black", "mypy"]
-# Optional inference fast path — install manually (not required on T4).
-# flash-attn targets Ampere (sm80)+.
-fast = ["flash-attn"]
 
 [tool.setuptools.packages.find]
 include = ["ouroboros*"]
@@ -60,8 +58,3 @@ testpaths = ["tests"]
 
 [tool.mypy]
 python_version = "3.10"
-
-[[tool.mypy.overrides]]
-# Optional Ampere-only fast path; not installed on T4/CI and ships no stubs.
-module = "flash_attn"
-ignore_missing_imports = true

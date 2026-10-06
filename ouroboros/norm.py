@@ -28,7 +28,7 @@ class RMSNorm(nn.Module):
     Gotcha (fp32 reduction): under mixed precision the activations are fp16/bf16,
     and computing ``mean(x**2)`` directly in low precision can underflow or lose
     accuracy. The reduction (square, mean, ``rsqrt``) must be performed in float32
-    and the result cast back to the input dtype before applying ``weight`` — this
+    and the result cast back to the input dtype before applying ``weight``; this
     is essential for numerical stability on the T4 (FP16) target.
     """
 

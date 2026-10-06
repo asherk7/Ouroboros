@@ -1,54 +1,32 @@
 """Mixture-of-Experts feed-forward components for Ouroboros.
 
-This module defines the two FFN building blocks used throughout the model:
+- ``Expert``: one SwiGLU feed-forward network. Used as a routed expert, as a
+  shared expert, and as the dense FFN in the Prelude/Coda blocks (width
+  ``dim * 4 // 3`` there).
+- ``MoEFFN``: fine-grained MoE with ``n_experts`` routed experts plus
+  ``n_shared_experts`` always-on shared experts. Only the recurrent block uses it.
 
-- ``Expert`` — a single SwiGLU feed-forward network. It serves a double duty:
-  as one routed expert inside :class:`MoEFFN`, and as the dense FFN inside the
-  Prelude/Coda :class:`~ouroboros.block.TransformerBlock` (instantiated there
-  with ``expert_dim = dim * 4 // 3``).
-- ``MoEFFN`` — a fine-grained Mixture-of-Experts FFN combining ``n_experts``
-  routed experts with ``n_shared_experts`` always-active shared experts. The
-  recurrent block is the only consumer of ``MoEFFN``.
+Design notes:
 
-Design notes (architecture, not implementation):
+- **Fine-grained experts (DeepSeekMoE).** Many small experts give a richer set
+  of expert combinations than a few large ones at the same active parameter
+  count. Rule of thumb: ``expert_dim ~= dim // (n_experts // n_experts_per_tok)``.
+- **Shared experts (DeepSeekMoE).** Fire for every token and absorb common
+  patterns so routed experts can specialize. Width
+  ``expert_dim * n_experts_per_tok``.
+- **Aux-loss-free load balancing (DeepSeek-V3).** A non-gradient
+  ``router_bias`` buffer is added to the logits for expert SELECTION only. The
+  gating WEIGHTS come from the unbiased ``softmax(logits)``, so the bias never
+  touches the gradient or the LM loss.
+- **The bias update.** Many reference implementations register ``router_bias``
+  but never update it, so balancing never happens. Here an ``expert_load``
+  buffer counts selections during ``forward`` and
+  :meth:`MoEFFN.update_router_bias` (called once per optimizer step) nudges the
+  bias toward balance.
+- **Dispatch.** A simple masked loop over experts is fine at this size.
 
-- **Fine-grained experts (DeepSeekMoE, Dai et al., 2024).** Many small experts
-  with a small ``expert_dim`` give a combinatorially richer routing space than a
-  few large experts at a matched activated-parameter budget. The rule of thumb
-  is ``expert_dim ~= dim // (n_experts // n_experts_per_tok)``.
-
-- **Shared experts.** ``n_shared_experts`` experts fire for *every* token and
-  absorb the common, cross-domain patterns (syntax, basic composition) that
-  would otherwise be redundantly relearned by many routed experts. They use a
-  LARGER hidden width than routed experts: ``expert_dim * n_experts_per_tok``.
-
-- **Aux-loss-free load balancing (DeepSeek-V3, 2024).** A per-expert
-  ``router_bias`` is a non-gradient buffer (``register_buffer``). Expert
-  *selection* uses ``topk(logits + router_bias)``, but the gating *weights* come
-  from the UNBIASED ``softmax(logits)`` renormalized over the selected top-K, so
-  the bias never enters the gradient and the language-modeling loss is never
-  distorted by a balancing term.
-
-- **Ouroboros completion of the bias update.** Reference implementations
-  register ``router_bias`` but leave it static — the load-balancing trick is
-  never actually applied. Ouroboros closes that gap: a non-trainable
-  ``expert_load`` buffer counts per-expert selections during ``forward``, and
-  :meth:`MoEFFN.update_router_bias` (called once per optimizer step by the
-  training loop) nudges the bias DOWN for overloaded experts and UP for
-  underloaded ones, driving the routed load toward uniform.
-
-- **Dispatch cost.** The reference dispatch is a token-scatter masked loop that
-  is ``O(n_experts_per_tok * n_experts)`` over masked sub-batches — correct but
-  slow. A grouped/batched-gather dispatch (sort tokens by expert, run each
-  expert on a contiguous slice) is noted as a future optimization.
-
-Cited literature: DeepSeekMoE (Dai et al., 2024,
-https://arxiv.org/abs/2401.06066); DeepSeek-V3 aux-loss-free load balancing
-(2024, https://arxiv.org/abs/2412.19437); GLU Variants / SwiGLU (Shazeer, 2020,
-https://arxiv.org/abs/2002.05202).
-
-NOTE: This is a Phase-3 scaffold. Every body raises ``NotImplementedError``;
-signatures, type hints, and docstrings are the contract.
+References: DeepSeekMoE (https://arxiv.org/abs/2401.06066); DeepSeek-V3
+(https://arxiv.org/abs/2412.19437); SwiGLU (https://arxiv.org/abs/2002.05202).
 """
 
 from __future__ import annotations
@@ -62,28 +40,20 @@ __all__ = ["Expert", "MoEFFN"]
 
 
 class Expert(nn.Module):
-    """A single SwiGLU feed-forward expert.
+    """A single SwiGLU feed-forward network: ``down(silu(gate(x)) * up(x))``.
 
-    Computes the gated-linear-unit variant
-    ``down(silu(gate(x)) * up(x))`` with all three projections bias-free. This
-    same module is reused as a dense FFN in the Prelude/Coda blocks, where it is
-    constructed with ``expert_dim = dim * 4 // 3`` (a deliberately leaner width
-    than the common ``8/3 * dim`` SwiGLU sizing, chosen to keep the small-model
-    parameter budget T4-friendly).
-
-    See ``GLU Variants Improve Transformer`` (Shazeer, 2020,
-    https://arxiv.org/abs/2002.05202).
+    All three projections are bias-free. Reused as the dense Prelude/Coda FFN
+    with ``expert_dim = dim * 4 // 3``.
     """
 
     def __init__(self, dim: int, expert_dim: int) -> None:
         """Initialize the SwiGLU projections.
 
         Args:
-            dim: Input and output feature dimension (the residual-stream width).
-            expert_dim: Inner hidden width of the expert. Routed experts use
-                ``cfg.expert_dim``; shared experts use
-                ``cfg.expert_dim * cfg.n_experts_per_tok``; dense Prelude/Coda
-                FFNs use ``dim * 4 // 3``.
+            dim: Input and output width (the residual-stream width).
+            expert_dim: Hidden width. Routed experts use ``cfg.expert_dim``;
+                shared experts use ``cfg.expert_dim * cfg.n_experts_per_tok``;
+                dense Prelude/Coda FFNs use ``dim * 4 // 3``.
         """
         super().__init__()
         raise NotImplementedError
@@ -95,111 +65,76 @@ class Expert(nn.Module):
             x: Input tensor of shape ``(..., dim)``.
 
         Returns:
-            Tensor of shape ``(..., dim)`` equal to ``down(silu(gate(x)) * up(x))``.
+            Tensor of shape ``(..., dim)``.
         """
         raise NotImplementedError
 
 
 class MoEFFN(nn.Module):
-    """Fine-grained Mixture-of-Experts FFN with aux-loss-free load balancing.
+    """Fine-grained MoE FFN with shared experts and aux-loss-free balancing.
 
-    Combines two classes of experts (DeepSeekMoE, Dai et al., 2024):
+    Routing, for ``N = B * T`` tokens::
 
-    - **Routed experts** — ``n_experts`` instances of ``Expert(dim, expert_dim)``.
-      Each token is routed to its top-``n_experts_per_tok`` experts by a learned
-      ``router = Linear(dim, n_experts, bias=False)``. The selected experts'
-      outputs are combined as a weighted sum of the (renormalized) gating
-      weights.
-    - **Shared experts** — ``n_shared_experts`` instances of
-      ``Expert(dim, expert_dim * n_experts_per_tok)`` that fire for EVERY token
-      and are added on top of the routed contribution.
+        logits   = router(x)                          # (N, n_experts)
+        scores   = softmax(logits)                    # weights: UNBIASED
+        topk_idx = topk(logits + router_bias, K)      # selection: biased
+        topk_w   = scores.gather(topk_idx)
+        topk_w   = topk_w / topk_w.sum(-1, keepdim)   # renormalize over K
+        out      = sum_k topk_w[k] * routed[topk_idx[k]](x) + sum_s shared[s](x)
 
-    Aux-loss-free load balancing (DeepSeek-V3, 2024):
-
-    - ``router_bias`` is a non-gradient buffer (``register_buffer``), shape
-      ``(n_experts,)``, initialized to zeros.
-    - Expert SELECTION uses ``topk(logits + router_bias)``.
-    - Gating WEIGHTS come from the UNBIASED ``softmax(logits)``, gathered at the
-      selected indices and renormalized to sum to 1 over the top-K. The bias
-      therefore never enters the gradient and never distorts the LM loss.
-
-    Ouroboros completion (improvement over naive reference impls that register
-    but never update the bias): an ``expert_load`` non-gradient buffer of shape
-    ``(n_experts,)`` accumulates per-expert selection counts during ``forward``,
-    and :meth:`update_router_bias` consumes it to step the bias toward balanced
-    routing. The training loop calls :meth:`update_router_bias` once per
-    optimizer step.
-
-    Dispatch cost: the reference dispatch is an ``O(n_experts_per_tok *
-    n_experts)`` token-scatter masked loop — correct but slow. A grouped /
-    batched-gather dispatch (sort tokens by chosen expert, run each expert on a
-    contiguous slice, scatter back) is the noted future optimization.
+    Submodules:
+        router: ``Linear(dim, n_experts, bias=False)``.
+        routed: ``n_experts`` x ``Expert(dim, expert_dim)``.
+        shared: ``n_shared_experts`` x ``Expert(dim, expert_dim * n_experts_per_tok)``.
 
     Buffers (non-gradient, ``register_buffer``):
-        router_bias: Shape ``(n_experts,)``. Bias added to router logits for
-            SELECTION only. Updated by :meth:`update_router_bias`, not by autograd.
-        expert_load: Shape ``(n_experts,)``. Running count of how many tokens
-            selected each routed expert since the last bias update. Consumed and
-            reset by :meth:`update_router_bias`.
+        router_bias: ``(n_experts,)``, zeros at init. Updated only by
+            :meth:`update_router_bias`, never by autograd.
+        expert_load: ``(n_experts,)``. Selection counts since the last bias
+            update; consumed and reset by :meth:`update_router_bias`.
+
+    Gotchas:
+        - Renormalize the top-K weights, or the routed output's scale depends on
+          how confident the router happened to be.
+        - ``router_bias`` must be a buffer. If it ever gets a gradient, the
+          aux-loss-free property is gone.
     """
 
     def __init__(self, cfg: OuroborosConfig) -> None:
-        """Build the router, routed experts, shared experts, and LB buffers.
+        """Build the router, routed experts, shared experts, and buffers.
 
         Args:
-            cfg: Model configuration. Uses ``dim``, ``n_experts``,
-                ``n_shared_experts``, ``n_experts_per_tok``, ``expert_dim``, and
+            cfg: Uses ``dim``, ``n_experts``, ``n_shared_experts``,
+                ``n_experts_per_tok``, ``expert_dim``, and
                 ``router_bias_update_rate``.
         """
         super().__init__()
         raise NotImplementedError
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Route tokens through top-K experts and add shared-expert output.
+        """Route tokens to their top-K experts and add the shared experts.
 
-        Selection uses ``topk(logits + router_bias)``; gating weights come from
-        the unbiased ``softmax(logits)`` renormalized over the selected top-K.
-        Shared experts always fire and are summed on top. Per-expert selection
-        counts are accumulated into the ``expert_load`` buffer for the
-        subsequent :meth:`update_router_bias` call (no autograd through either
-        the bias or the load counter).
-
-        ``expert_load`` accumulation is gated on ``self.training``: eval /
-        generation forwards must NOT add to the counter, or validation passes
-        between optimizer steps would contaminate the balance signal with a
-        token distribution the optimizer never trained on.
+        Accumulate per-expert selection counts into ``expert_load`` only while
+        ``self.training`` is ``True``: eval and generation passes must not
+        pollute the balance signal.
 
         Args:
             x: Input tensor of shape ``(B, T, dim)``.
 
         Returns:
-            Tensor of shape ``(B, T, dim)``: the gate-weighted sum of the
-            selected routed experts plus all shared experts.
+            Tensor of shape ``(B, T, dim)``.
         """
         raise NotImplementedError
 
     @torch.no_grad()
     def update_router_bias(self) -> None:
-        """Apply one aux-loss-free load-balancing bias step (Ouroboros completion).
+        """Apply one aux-loss-free load-balancing step, then reset the counter.
 
-        Consumes the accumulated ``expert_load`` buffer and nudges each entry of
-        ``router_bias`` toward balanced routing: the bias is moved DOWN for
-        overloaded experts and UP for underloaded ones, by
+        Moves the bias down for overloaded experts and up for underloaded ones::
 
-            ``router_bias -= cfg.router_bias_update_rate * sign(load - mean_load)``
+            router_bias -= router_bias_update_rate * sign(load - mean_load)
 
-        (equivalently, ``+= rate * sign(mean_load - load)``), after which the
-        ``expert_load`` accumulator is reset. Because ``router_bias`` only
-        affects SELECTION (never the gating weights), this rebalances which
-        experts fire without touching the gradient or the LM loss.
-
-        Call **once per optimizer step — not per micro-batch**. Under gradient
-        accumulation, ``expert_load`` is meant to accumulate across all
-        micro-batches of one effective batch; calling this per micro-batch
-        resets the counter before it has seen the full batch and biases the
-        update toward whichever micro-batch ran last. (``expert_load`` also only
-        accumulates while ``self.training`` is ``True`` — see :meth:`forward`.)
-        Runs under ``torch.no_grad()`` and mutates buffers in place; returns
-        nothing.
+        Call once per optimizer step, not per micro-batch: under gradient
+        accumulation ``expert_load`` should cover the whole effective batch.
         """
         raise NotImplementedError

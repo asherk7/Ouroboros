@@ -1,20 +1,19 @@
-"""Ouroboros — a recurrent-depth (looped) transformer implemented from scratch in PyTorch.
+"""Ouroboros: a recurrent-depth (looped) transformer written from scratch in PyTorch.
 
-This package exposes the public API of the Ouroboros architecture: a
-Prelude / Recurrent / Coda design with fine-grained Mixture-of-Experts
-(routed + shared experts), GQA attention, LTI-constrained stable input
-injection (spectral radius < 1 by construction), and a KV-cached /
-continuous-depth-wise-batching inference path. The model is designed to be
-trained on a single Google Colab T4 GPU (16 GB, Turing sm75, FP16).
+A learning project. The model is a Prelude / Recurrent / Coda design: a few
+dense blocks encode the input once, one weight-shared block (GQA attention plus
+a fine-grained MoE FFN) is looped a variable number of times with LTI-stable
+input injection, and a few dense blocks decode the result. Training samples a
+random loop count each step, so the loop count can be changed at test time.
 
-The components below are re-exported here so callers can do, e.g.::
+The components below are re-exported so callers can do, e.g.::
 
     from ouroboros import Ouroboros, OuroborosConfig
 
     model = Ouroboros(OuroborosConfig())
 
-See ``docs/ARCHITECTURE.md`` for the full component contract and the
-forward-pass data-flow diagram.
+See ``ARCHITECTURE.md`` for the component reference and the forward-pass
+diagram.
 """
 
 from importlib.metadata import PackageNotFoundError
@@ -30,8 +29,10 @@ from .recurrence import (
     LTIInjection,
     RecurrentBlock,
     loop_index_embedding,
+    sample_n_loops,
 )
 from .rope import apply_rope, precompute_rope_freqs
+from .tiled_attention import tiled_attention
 
 # Single-source the version from pyproject.toml package metadata; fall back for
 # the from-source (not pip-installed) case.
@@ -49,6 +50,7 @@ __all__ = [
     "apply_rope",
     # Attention
     "GQAttention",
+    "tiled_attention",
     # MoE
     "Expert",
     "MoEFFN",
@@ -56,6 +58,7 @@ __all__ = [
     "TransformerBlock",
     # Recurrence
     "loop_index_embedding",
+    "sample_n_loops",
     "LTIInjection",
     "RecurrentBlock",
     # Model

@@ -1,24 +1,20 @@
 # Ouroboros runtime + development dependencies.
-# Target hardware: single Google Colab T4 (16 GB, Turing sm75, FP16).
-# Pins are intentionally loose / lower-bounded to stay Colab-compatible.
+# Target hardware: a single Google Colab T4 (16 GB, fp16).
+# Pins are loose / lower-bounded to stay Colab-compatible.
 
 # --- Core ---
-torch>=2.1            # SDPA flash/mem-efficient backend lives here; T4-compatible
-numpy                 # array/host-side ops, RoPE precompute helpers
+torch>=2.1            # includes F.scaled_dot_product_attention
+numpy
 
 # --- Data + tokenization ---
-datasets              # WikiText-103 / FineWeb-Edu slices for training
-transformers          # tokenizer + dataset utilities (model code is from scratch)
-tokenizers            # fast BPE tokenizer training (small vocab_size=8192)
+datasets              # TinyStories
+transformers          # dataset / tokenizer utilities (model code is from scratch)
+tokenizers            # training the 8192-token BPE
 
-# --- Training / experiment tracking ---
-wandb                 # log loss, ρ(A) spectral radius, grad norm, tokens/s
-tqdm                  # progress bars for training/benchmark loops
+# --- Training / evaluation ---
+wandb                 # optional run logging (loss, rho(A), grad norm)
+tqdm                  # progress bars
+matplotlib            # the loop-sweep plot
 
 # --- Testing ---
-pytest                # unit + integration test suite
-
-# --- Optional fast path (install manually; NOT required on T4) ---
-# flash-attn          # FlashAttention-2 native kernel — Ampere (sm80)+ only;
-#                     # forward-only and often fails to build on Turing (T4).
-#                     # On T4 the SDPA flash backend is the realistic path.
+pytest

@@ -11,8 +11,8 @@ it to the current positions before calling :func:`apply_rope`.
 
 This module exposes two functions:
 
-* :func:`precompute_rope_freqs` — build the complex phasor table once.
-* :func:`apply_rope` — rotate a Q/K tensor using a (pre-sliced) phasor table.
+* :func:`precompute_rope_freqs`: build the complex phasor table once.
+* :func:`apply_rope`: rotate a Q/K tensor using a (pre-sliced) phasor table.
 """
 
 import torch
@@ -58,7 +58,7 @@ def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     complex number and multiplied by the per-position phasor ``freqs_cis[t, k]``,
     which rotates it by the position-dependent angle in the complex plane; the
     result is viewed back as two real features. Rotation is a pure isometry, so it
-    **preserves the per-vector L2 norm** — only the phase (relative orientation)
+    **preserves the per-vector L2 norm**; only the phase (relative orientation)
     changes, which is what makes attention logits depend on relative position.
 
     Args:
@@ -67,7 +67,7 @@ def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         freqs_cis: Complex phasor table of shape ``(T, head_dim // 2)``, already
             **sliced by the caller** to exactly the positions being processed
             (``start_pos : start_pos + T``). ``apply_rope`` does **not** know
-            ``start_pos`` — passing an unsliced or wrongly-offset table silently
+            ``start_pos``; passing an unsliced or wrongly-offset table silently
             applies the wrong rotation (the classic incremental-decode bug where
             cached tokens get position-0 rotations).
 
@@ -82,7 +82,7 @@ def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     Notes:
         * Position 0 is the identity: ``freqs_cis[0]`` is ``1 + 0j``, so the first
           token passes through unrotated.
-        * Norm-preserving: ``||apply_rope(x)|| == ||x||`` per head vector — useful
+        * Norm-preserving: ``||apply_rope(x)|| == ||x||`` per head vector, useful
           as a unit-test invariant (alongside the position-0 identity check).
         * The caller is responsible for slicing ``freqs_cis`` to the current
           positions; this function operates purely on the slice it is given.
