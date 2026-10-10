@@ -27,6 +27,7 @@ loop count can change at test time.
 - [Huginn: Scaling up Test-Time Compute with Latent Reasoning](https://arxiv.org/abs/2502.05171) (Geiping et al., 2025). READ the architecture and training sections: Prelude/Recurrent/Coda, random loop count, truncated backprop, sandwich norm, the failed runs. Then the test-time section (early exit, KV sharing).
 - [Universal Transformers](https://arxiv.org/abs/1807.03819) (Dehghani et al., 2018). SKIM section 2: the original weight-tied loop and its per-step timestep signal, which the loop index copies.
 - [Reasoning with Latent Thoughts](https://arxiv.org/abs/2502.17416) (Saunshi et al., 2025). SKIM intro and main results: why looping adds effective depth at a fixed parameter count.
+- [Scaling Latent Reasoning via Looped Language Models](https://arxiv.org/abs/2510.25741) (Zhu et al., 2025). SKIM the intro and the architecture section.
 
 **Build:** nothing yet. Skim the stubs to see where each piece will go.
 
@@ -40,9 +41,9 @@ feed-forward layer.
 - [RMSNorm](https://arxiv.org/abs/1910.07467) (Zhang and Sennrich, 2019). SKIM: why dropping LayerNorm's mean subtraction loses nothing.
 - [GLU Variants Improve Transformer](https://arxiv.org/abs/2002.05202) (Shazeer, 2020). READ (two pages): the gated feed-forward family and SwiGLU.
 
-**Build:** `RMSNorm`, `Expert` (SwiGLU).
+**Build:** `RMSNorm`, `FeedForward` (dense SwiGLU).
 
-**Done when:** RMSNorm rows have unit RMS; `Expert` keeps the shape.
+**Done when:** RMSNorm rows have unit RMS; `FeedForward` keeps the shape.
 
 ## 3. Positions: RoPE
 

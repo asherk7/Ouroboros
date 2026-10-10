@@ -1,10 +1,9 @@
 """Mixture-of-Experts feed-forward components for Ouroboros.
 
-- ``Expert``: one SwiGLU feed-forward network. Used as a routed expert, as a
-  shared expert, and as the dense FFN in the Prelude/Coda blocks (width
-  ``dim * 4 // 3`` there).
-- ``MoEFFN``: fine-grained MoE with ``n_experts`` routed experts plus
-  ``n_shared_experts`` always-on shared experts. Only the recurrent block uses it.
+``MoEFFN``: a fine-grained MoE with ``n_experts`` routed experts plus
+``n_shared_experts`` always-on shared experts. Only the recurrent block uses
+it. Each expert is a :class:`~ouroboros.feedforward.FeedForward` (a dense
+SwiGLU network) behind the router.
 
 Design notes:
 
@@ -35,39 +34,9 @@ import torch
 import torch.nn as nn
 
 from .config import OuroborosConfig
+from .feedforward import FeedForward  # noqa: F401  (used once implemented)
 
-__all__ = ["Expert", "MoEFFN"]
-
-
-class Expert(nn.Module):
-    """A single SwiGLU feed-forward network: ``down(silu(gate(x)) * up(x))``.
-
-    All three projections are bias-free. Reused as the dense Prelude/Coda FFN
-    with ``expert_dim = dim * 4 // 3``.
-    """
-
-    def __init__(self, dim: int, expert_dim: int) -> None:
-        """Initialize the SwiGLU projections.
-
-        Args:
-            dim: Input and output width (the residual-stream width).
-            expert_dim: Hidden width. Routed experts use ``cfg.expert_dim``;
-                shared experts use ``cfg.expert_dim * cfg.n_experts_per_tok``;
-                dense Prelude/Coda FFNs use ``dim * 4 // 3``.
-        """
-        super().__init__()
-        raise NotImplementedError
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the SwiGLU transform.
-
-        Args:
-            x: Input tensor of shape ``(..., dim)``.
-
-        Returns:
-            Tensor of shape ``(..., dim)``.
-        """
-        raise NotImplementedError
+__all__ = ["MoEFFN"]
 
 
 class MoEFFN(nn.Module):
@@ -84,8 +53,8 @@ class MoEFFN(nn.Module):
 
     Submodules:
         router: ``Linear(dim, n_experts, bias=False)``.
-        routed: ``n_experts`` x ``Expert(dim, expert_dim)``.
-        shared: ``n_shared_experts`` x ``Expert(dim, expert_dim * n_experts_per_tok)``.
+        routed: ``n_experts`` x ``FeedForward(dim, expert_dim)``.
+        shared: ``n_shared_experts`` x ``FeedForward(dim, expert_dim * n_experts_per_tok)``.
 
     Buffers (non-gradient, ``register_buffer``):
         router_bias: ``(n_experts,)``, zeros at init. Updated only by

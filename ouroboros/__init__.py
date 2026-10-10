@@ -23,7 +23,8 @@ from .attention import GQAttention
 from .block import TransformerBlock
 from .config import OuroborosConfig
 from .model import Ouroboros
-from .moe import Expert, MoEFFN
+from .feedforward import FeedForward
+from .moe import MoEFFN
 from .norm import RMSNorm
 from .recurrence import (
     LTIInjection,
@@ -51,8 +52,8 @@ __all__ = [
     # Attention
     "GQAttention",
     "tiled_attention",
-    # MoE
-    "Expert",
+    # Feed-forward and MoE
+    "FeedForward",
     "MoEFFN",
     # Block
     "TransformerBlock",
