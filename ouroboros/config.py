@@ -1,26 +1,6 @@
-"""Hyperparameter configuration for the Ouroboros model.
+"""Hyperparameter configuration for Ouroboros.
 
-:class:`OuroborosConfig` is the single source of truth for every architectural
-hyperparameter. Every component reads its dimensions from it, so the field
-names here are the project-wide contract used by the code and by
-``ARCHITECTURE.md``.
-
-Defaults target a small model (about 19.8M total parameters, about 17.4M active
-per token) that trains on TinyStories on a single Colab T4 (16 GB, fp16).
-
-Sizing notes:
-
-* **Fine-grained MoE rule of thumb:** ``expert_dim ~= dim // (n_experts //
-  n_experts_per_tok)``. With the defaults that is ``512 // 4 = 128``; the
-  default ``expert_dim=256`` runs a little wider for small-model capacity.
-* **Shared-expert width:** shared experts are wider than routed ones, width
-  ``expert_dim * n_experts_per_tok``, so they can absorb common structure.
-* **Prelude / Coda FFN width:** the dense SwiGLU FFN uses the standard
-  ``dim * 8 // 3``, which keeps its parameter count close to a ``4 * dim`` MLP.
-* **Vocabulary:** at small ``dim`` the tied embedding table dominates the
-  parameter count, which is why ``vocab_size=8192``.
-* **Tiny test config:** the test suite builds a CPU-fast config with
-  ``tiny_config()`` (``dim=64``, ``n_heads=4``, ...). It is not hardcoded here.
+Defaults give a ~20M-parameter model sized for TinyStories on a Colab T4.
 """
 
 from dataclasses import dataclass
@@ -29,12 +9,7 @@ from typing import Optional
 
 @dataclass
 class OuroborosConfig:
-    """Architecture hyperparameters for :class:`~ouroboros.model.Ouroboros`.
-
-    Cross-field invariants are validated in :meth:`__post_init__`, so an invalid
-    combination fails at construction with a clear message rather than as a
-    shape error deep in a forward pass.
-    """
+    """Architecture hyperparameters; invalid combinations raise ``ValueError``."""
 
     # --- Core ---
     # small BPE vocab keeps the embedding table modest at small dim
@@ -74,17 +49,13 @@ class OuroborosConfig:
 
     @property
     def loop_dim(self) -> int:
-        """Channels that receive the loop-index embedding.
-
-        ``loop_index_dim`` if set, else ``dim // 8`` rounded down to even (and at
-        least 2), so an untouched default never fails the even check.
-        """
+        """``loop_index_dim`` if set, else ``dim // 8`` rounded down to even (min 2)."""
         if self.loop_index_dim is not None:
             return self.loop_index_dim
         return max(2, (self.dim // 8) // 2 * 2)
 
     def __post_init__(self) -> None:
-        """Validate cross-field invariants; raise ``ValueError`` on violation."""
+        """Validate cross-field invariants."""
         for name in (
             "vocab_size",
             "dim",

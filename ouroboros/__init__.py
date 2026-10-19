@@ -1,19 +1,7 @@
-"""Ouroboros: a recurrent-depth (looped) transformer written from scratch in PyTorch.
+"""Ouroboros: a recurrent-depth (looped) transformer in PyTorch.
 
-A learning project. The model is a Prelude / Recurrent / Coda design: a few
-dense blocks encode the input once, one weight-shared block (GQA attention plus
-a fine-grained MoE FFN) is looped a variable number of times with LTI-stable
-input injection, and a few dense blocks decode the result. Training samples a
-random loop count each step, so the loop count can be changed at test time.
-
-The components below are re-exported so callers can do, e.g.::
-
-    from ouroboros import Ouroboros, OuroborosConfig
-
-    model = Ouroboros(OuroborosConfig())
-
-See ``ARCHITECTURE.md`` for the component reference and the forward-pass
-diagram.
+Prelude blocks encode the input once, one shared GQA + MoE block loops a
+variable number of times, and Coda blocks decode. See ``ARCHITECTURE.md``.
 """
 
 from importlib.metadata import PackageNotFoundError

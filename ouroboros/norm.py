@@ -1,13 +1,4 @@
-"""Root Mean Square Layer Normalization for Ouroboros.
-
-Ouroboros uses RMSNorm (Zhang & Sennrich, 2019) in place of LayerNorm everywhere
-a normalization is needed: inside every :class:`~ouroboros.block.TransformerBlock`
-(pre-norm on the attention and FFN sublayers), on the combined hidden state inside
-the recurrent loop, and as the final norm before the LM head. RMSNorm drops the
-mean-subtraction and bias of LayerNorm, keeping only a
-learned per-channel rescaling, which is cheaper and empirically just as stable for
-transformer training.
-"""
+"""RMSNorm for Ouroboros."""
 
 import torch
 import torch.nn as nn
@@ -16,30 +7,16 @@ import torch.nn as nn
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization (Zhang & Sennrich, 2019).
 
-    Normalizes each input vector by its root-mean-square over the last dimension,
-    then rescales by a learned per-channel ``weight`` (initialized to ones). There
-    is **no** bias term and **no** mean subtraction:
-
-    .. math::
-
-        \\mathrm{RMSNorm}(x) = \\frac{x}{\\sqrt{\\frac{1}{d}\\sum_i x_i^2 + \\epsilon}}
-                               \\odot \\mathrm{weight}
-
-    Gotcha (fp32 reduction): under mixed precision the activations are fp16/bf16,
-    and computing ``mean(x**2)`` directly in low precision can underflow or lose
-    accuracy. The reduction (square, mean, ``rsqrt``) must be performed in float32
-    and the result cast back to the input dtype before applying ``weight``; this
-    is essential for numerical stability on the T4 (FP16) target.
+    ``x / sqrt(mean(x**2) + eps) * weight``, with no bias or mean subtraction.
+    The reduction runs in float32 so fp16 activations don't overflow.
     """
 
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
-        """Initialize the norm.
+        """Create the learned per-channel weight (init to ones).
 
         Args:
-            dim: Feature dimension to normalize over (size of the last axis). A
-                learned ``weight`` parameter of this size is created, init to ones.
-            eps: Small constant added inside the square root for numerical
-                stability. Matches ``OuroborosConfig.norm_eps`` (default ``1e-6``).
+            dim: Size of the last axis.
+            eps: Added inside the square root.
         """
         super().__init__()
         self.eps = eps
@@ -47,26 +24,13 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply RMS normalization along the last dimension.
-
-        Args:
-            x: Input tensor of shape ``(..., dim)``; any leading batch/sequence
-                dims are preserved. May be fp16/bf16 under mixed precision.
-
-        Returns:
-            Normalized tensor of the **same shape and dtype** as ``x``, rescaled
-            per channel by ``self.weight``. The RMS reduction is computed in
-            float32 internally and cast back to ``x.dtype``.
-
-        Shapes:
-            ``(..., dim) -> (..., dim)``
-        """
+        """Normalize over the last dim: ``(..., dim) -> (..., dim)``, same dtype as ``x``."""
         # upscale x to a higher type so that we don't risk overflow when computing the power
         # activations can overflow to infinity, which causes rsqrt to give 0, wiping out that activation position
         original_dtype = x.dtype
         x_upscale = x.to(torch.float32)
         # calculate the reciprocal square root so it's 1/RMS, use multiplication since it's faster
         inv_rms = torch.rsqrt(x_upscale.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        # cast the output back to the original dtype, since rms is fp32, it will raise x to fp32
-        output = (x * inv_rms * self.weight).to(original_dtype)
+        # cast the output back to the original dtype, since x_upscale & rms are fp32
+        output = (x_upscale * inv_rms * self.weight).to(original_dtype)
         return output
