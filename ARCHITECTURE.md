@@ -155,9 +155,8 @@ the score matrix:
 
 FlashAttention-2 keeps the algorithm and reorganizes the work (fewer non-matmul
 operations, better parallelism across the sequence). Ouroboros trains on
-PyTorch's fused attention, which uses a FlashAttention-style kernel; the
-algorithm itself is reimplemented in plain PyTorch as an exercise and checked
-against it.
+PyTorch's fused attention (`F.scaled_dot_product_attention`), which uses a
+FlashAttention-style kernel; Ouroboros does not reimplement it.
 
 ### Feed-forward: SwiGLU
 

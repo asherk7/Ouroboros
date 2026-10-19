@@ -10,8 +10,7 @@ interchangeable paths that must agree numerically:
    same tiling idea). Nothing to configure.
 2. **Manual path (the reference):** plain ``softmax(Q K^T / sqrt(d)) V`` with an
    explicit causal mask. Slow, but every step is visible. Selected with
-   ``use_sdpa=False``; the tests use it to check the SDPA path and
-   :func:`~ouroboros.tiled_attention.tiled_attention`.
+   ``use_sdpa=False``; the tests use it to check the SDPA path.
 
 The ``forward`` signature ``(x, freqs_cis, causal=True, kv_cache=None,
 cache_key="default")`` is the attention contract consumed by

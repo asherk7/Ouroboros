@@ -28,9 +28,9 @@ the code makes the reading concrete. The papers behind it are in the
   defined at any depth.
 - **GQA with QK-norm and a KV cache**: each loop iteration keeps its own cache
   entries, so grouped KV heads matter more here than in a plain transformer.
-- **FlashAttention, understood**: trains on PyTorch SDPA, with FlashAttention's
-  tiled online-softmax algorithm reimplemented in plain PyTorch and checked
-  against it.
+- **FlashAttention, understood**: trains on PyTorch SDPA, which uses a
+  FlashAttention-style fused kernel; the tiling and online-softmax algorithm
+  are studied, not reimplemented.
 - **Fine-grained Mixture-of-Experts** in the looped block (from DeepSeekMoE and
   DeepSeek-V3): routed plus shared experts, balanced with an aux-loss-free
   router-bias update.

@@ -33,7 +33,6 @@ from .recurrence import (
     sample_n_loops,
 )
 from .rope import apply_rope, precompute_rope_freqs
-from .tiled_attention import tiled_attention
 
 # Single-source the version from pyproject.toml package metadata; fall back for
 # the from-source (not pip-installed) case.
@@ -51,7 +50,6 @@ __all__ = [
     "apply_rope",
     # Attention
     "GQAttention",
-    "tiled_attention",
     # Feed-forward and MoE
     "FeedForward",
     "MoEFFN",

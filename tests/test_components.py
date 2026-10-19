@@ -7,7 +7,7 @@ implemented; later sections still skip with ``pytest.skip("stub: section N")``. 
 * Section 2: ``RMSNorm``, ``FeedForward`` (SwiGLU).
 * Section 3: RoPE.
 * Section 4: ``GQAttention`` (no cache). Section 5: its KV cache.
-* Section 6: ``tiled_attention``.
+* Section 6: nothing (theory only; the model uses PyTorch SDPA).
 * Section 7: ``MoEFFN``, ``TransformerBlock``.
 * Section 8: ``loop_index_embedding``, ``sample_n_loops``, ``LTIInjection``,
   ``RecurrentBlock``.
@@ -40,7 +40,6 @@ from ouroboros import (  # noqa: F401
     loop_index_embedding,
     precompute_rope_freqs,
     sample_n_loops,
-    tiled_attention,
 )
 
 
@@ -156,10 +155,11 @@ def test_rmsnorm_matches_formula() -> None:
     """
     torch.manual_seed(0)
     norm = RMSNorm(64, eps=1e-6)
+    weight = norm.get_parameter("weight")
     with torch.no_grad():
-        norm.weight.copy_(torch.randn(64))
+        weight.copy_(torch.randn(64))
     x = 5.0 * torch.randn(2, 8, 64) + 3.0
-    expected = x / torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6) * norm.weight
+    expected = x / torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1e-6) * weight
     torch.testing.assert_close(norm(x), expected)
 
 
@@ -283,7 +283,7 @@ def test_feedforward_matches_swiglu_formula() -> None:
 
 
 # ===========================================================================
-# GQAttention (4), KV cache (5), tiled_attention (6)
+# GQAttention (4) and its KV cache (5)
 # ===========================================================================
 
 
@@ -383,22 +383,6 @@ def test_gqattention_cached_decode_matches_one_shot() -> None:
         for t in range(8)
     ]
     torch.testing.assert_close(torch.cat(steps, dim=1), full, atol=1e-5, rtol=1e-4)
-
-
-def test_tiled_attention_matches_sdpa() -> None:
-    """``tiled_attention`` matches ``F.scaled_dot_product_attention``.
-
-    Check both ``causal=True`` and ``causal=False``, with a sequence length that
-    is not a multiple of ``block_size`` (to catch edge blocks).
-    """
-    torch.manual_seed(0)
-    # T = 70 with block_size = 16: four full blocks plus a ragged block of 6.
-    q, k, v = (torch.randn(2, 4, 70, 16) for _ in range(3))
-    for causal in (True, False):
-        expected = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
-        out = tiled_attention(q, k, v, causal=causal, block_size=16)
-        assert out.shape == expected.shape
-        torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-4)
 
 
 # ===========================================================================

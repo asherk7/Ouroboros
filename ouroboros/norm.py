@@ -42,7 +42,9 @@ class RMSNorm(nn.Module):
                 stability. Matches ``OuroborosConfig.norm_eps`` (default ``1e-6``).
         """
         super().__init__()
-        raise NotImplementedError
+        self.eps = eps
+        # create the learned gain
+        self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply RMS normalization along the last dimension.
@@ -59,4 +61,12 @@ class RMSNorm(nn.Module):
         Shapes:
             ``(..., dim) -> (..., dim)``
         """
-        raise NotImplementedError
+        # upscale x to a higher type so that we don't risk overflow when computing the power
+        # activations can overflow to infinity, which causes rsqrt to give 0, wiping out that activation position
+        original_dtype = x.dtype
+        x_upscale = x.to(torch.float32)
+        # calculate the reciprocal square root so it's 1/RMS, use multiplication since it's faster
+        inv_rms = torch.rsqrt(x_upscale.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        # cast the output back to the original dtype, since rms is fp32, it will raise x to fp32
+        output = (x * inv_rms * self.weight).to(original_dtype)
+        return output

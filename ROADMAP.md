@@ -91,9 +91,9 @@ recomputation.
 - [Online normalizer calculation for softmax](https://arxiv.org/abs/1805.02867) (Milakov and Gimelshein, 2018). SKIM: the running-max trick FlashAttention builds on.
 - [FlashAttention-2](https://arxiv.org/abs/2307.08691) (Dao, 2023). SKIM: what changes from FA1 (work partitioning, fewer non-matmul operations).
 
-**Build:** `tiled_attention`.
+**Build:** nothing. Theory only: the model uses PyTorch's built-in `F.scaled_dot_product_attention` (the SDPA path in `GQAttention`, section 4), which dispatches to a FlashAttention-style fused kernel.
 
-**Done when:** it matches SDPA, causal and not, including a sequence length that is not a multiple of the block size.
+**Done when:** you can explain tiling, the online-softmax rescale by `exp(m_old - m_new)`, and why recomputation in the backward pass is worth it.
 
 ## 7. Mixture of experts
 
