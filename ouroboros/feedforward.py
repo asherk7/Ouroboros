@@ -7,7 +7,7 @@ the first). It is always a dense SwiGLU network::
 
 It is used in three places, differing only in hidden width:
 
-- the dense FFN in every Prelude and Coda block (``hidden_dim = dim * 4 // 3``);
+- the dense FFN in every Prelude and Coda block (``hidden_dim = dim * 8 // 3``);
 - each routed expert inside :class:`~ouroboros.moe.MoEFFN`
   (``hidden_dim = cfg.expert_dim``);
 - each shared expert inside :class:`~ouroboros.moe.MoEFFN`
@@ -28,10 +28,12 @@ __all__ = ["FeedForward"]
 
 class FeedForward(nn.Module):
     """Dense SwiGLU feed-forward network: ``down(silu(gate(x)) * up(x))``.
-
-    Three bias-free projections: ``gate`` and ``up`` map ``dim -> hidden_dim``,
-    ``down`` maps ``hidden_dim -> dim``. ``silu(z) = z * sigmoid(z)``; the gate
-    multiplies ``up(x)`` elementwise.
+        
+    Three bias-free projections: 
+    - ``gate`` and ``up`` map ``dim -> hidden_dim``
+    - ``down`` maps ``hidden_dim -> dim``
+    - ``silu(z) = z * sigmoid(z)``
+    - the gate multiplies ``up(x)`` elementwise.
     """
 
     def __init__(self, dim: int, hidden_dim: int) -> None:
@@ -39,12 +41,15 @@ class FeedForward(nn.Module):
 
         Args:
             dim: Input and output width (the residual-stream width).
-            hidden_dim: Inner width. ``dim * 4 // 3`` for the dense Prelude/Coda
+            hidden_dim: Inner width. ``dim * 8 // 3`` for the dense Prelude/Coda
                 FFN; ``cfg.expert_dim`` for a routed expert;
                 ``cfg.expert_dim * cfg.n_experts_per_tok`` for a shared expert.
         """
         super().__init__()
-        raise NotImplementedError
+        self.activation = nn.SiLU()
+        self.gate = nn.Linear(dim, hidden_dim, bias=False)
+        self.up = nn.Linear(dim, hidden_dim, bias=False)
+        self.down = nn.Linear(hidden_dim, dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the SwiGLU transform.
@@ -55,4 +60,10 @@ class FeedForward(nn.Module):
         Returns:
             Tensor of shape ``(..., dim)``.
         """
-        raise NotImplementedError
+
+        x_gated = self.activation(self.gate(x))
+        x_content = self.up(x)
+        # potential optimization: have one linear for "gate" and "up", do one matmul then split in half
+        x = x_gated * x_content
+        output = self.down(x)
+        return output
