@@ -7,7 +7,7 @@
 
 Attention is always :class:`~ouroboros.attention.GQAttention`. The FFN is chosen
 by ``use_moe``: ``True`` gives :class:`~ouroboros.moe.MoEFFN`, ``False`` gives a
-dense :class:`~ouroboros.feedforward.FeedForward` (SwiGLU) of width ``dim * 4 // 3``::
+dense :class:`~ouroboros.feedforward.FeedForward` (SwiGLU) of width ``dim * 8 // 3``::
 
     x = x + dropout(attn(rmsnorm(x), ...))
     x = x + dropout(ffn(rmsnorm(x)))
@@ -37,7 +37,7 @@ class TransformerBlock(nn.Module):
 
     - ``attn``: :class:`~ouroboros.attention.GQAttention`.
     - ``ffn``: :class:`~ouroboros.moe.MoEFFN` if ``use_moe`` else
-      ``FeedForward(cfg.dim, cfg.dim * 4 // 3)`` (dense SwiGLU).
+      ``FeedForward(cfg.dim, cfg.dim * 8 // 3)`` (dense SwiGLU).
     - ``attn_norm``, ``ffn_norm``: two :class:`~ouroboros.norm.RMSNorm`.
 
     ``use_moe=True`` is used only by the

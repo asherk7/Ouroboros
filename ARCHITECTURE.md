@@ -167,8 +167,7 @@ FlashAttention-style kernel; Ouroboros does not reimplement it.
 A gated feed-forward layer: one projection, passed through SiLU, gates another
 elementwise. It beats ReLU and GELU MLPs per parameter and is standard in
 LLaMA- and DeepSeek-class models. The Prelude and Coda use a dense SwiGLU of
-hidden width `4/3 · dim`, narrower than the usual `8/3 · dim` to leave parameter
-budget for the MoE.
+the standard hidden width `8/3 · dim`.
 
 ### Mixture of experts (recurrent block only)
 
@@ -302,4 +301,4 @@ passes hurt quality in Nanbeige's experiments, so the shortcut is not free.
 | Layers | 2 Prelude + 1 looped (8 loops on average) + 2 Coda |
 | MoE | 8 routed experts (top 2) + 1 shared, recurrent block only |
 | Vocabulary / context | 8192 / 512 tokens |
-| Parameters | about 15.6M total (4.2M of it the tied embedding), about 13.2M active per token |
+| Parameters | about 19.8M total (4.2M of it the tied embedding), about 17.4M active per token |

@@ -34,7 +34,7 @@ the code makes the reading concrete. The papers behind it are in the
 - **Fine-grained Mixture-of-Experts** in the looped block (from DeepSeekMoE and
   DeepSeek-V3): routed plus shared experts, balanced with an aux-loss-free
   router-bias update.
-- **Small**: about 15.6M parameters, trained on TinyStories on a single Colab
+- **Small**: about 19.8M parameters, trained on TinyStories on a single Colab
   T4.
 
 ---
@@ -104,7 +104,7 @@ pip install -e .            # or: pip install -r requirements.txt
 import torch
 from ouroboros import Ouroboros, OuroborosConfig
 
-cfg = OuroborosConfig()                           # ~15.6M-parameter default
+cfg = OuroborosConfig()                           # ~19.8M-parameter default
 model = Ouroboros(cfg)
 input_ids = torch.randint(0, cfg.vocab_size, (1, 16))
 

@@ -266,7 +266,7 @@ def test_apply_rope_dot_product_depends_only_on_relative_position() -> None:
 def test_feedforward_output_shape() -> None:
     """``FeedForward(dim, hidden_dim)`` maps ``(B, T, dim)`` to ``(B, T, dim)``."""
     # hidden_dim != dim, so mixing up the two widths raises a shape error.
-    ff = FeedForward(64, 64 * 4 // 3)
+    ff = FeedForward(64, 64 * 8 // 3)
     x = torch.randn(2, 8, 64)
     assert ff(x).shape == (2, 8, 64)
 

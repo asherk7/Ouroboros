@@ -5,7 +5,7 @@ hyperparameter. Every component reads its dimensions from it, so the field
 names here are the project-wide contract used by the code and by
 ``ARCHITECTURE.md``.
 
-Defaults target a small model (about 15.6M total parameters, about 13.2M active
+Defaults target a small model (about 19.8M total parameters, about 17.4M active
 per token) that trains on TinyStories on a single Colab T4 (16 GB, fp16).
 
 Sizing notes:
@@ -15,8 +15,8 @@ Sizing notes:
   default ``expert_dim=256`` runs a little wider for small-model capacity.
 * **Shared-expert width:** shared experts are wider than routed ones, width
   ``expert_dim * n_experts_per_tok``, so they can absorb common structure.
-* **Prelude / Coda FFN width:** the dense SwiGLU FFN uses ``dim * 4 // 3``,
-  smaller than the usual ``8/3 * dim``, to leave parameter budget for the MoE.
+* **Prelude / Coda FFN width:** the dense SwiGLU FFN uses the standard
+  ``dim * 8 // 3``, which keeps its parameter count close to a ``4 * dim`` MLP.
 * **Vocabulary:** at small ``dim`` the tied embedding table dominates the
   parameter count, which is why ``vocab_size=8192``.
 * **Tiny test config:** the test suite builds a CPU-fast config with
