@@ -410,15 +410,15 @@ def test_moeffn_shared_experts_always_fire() -> None:
     cfg = tiny_config(n_shared_experts=2)  # 2, so a mean would not pass as a sum
     moe = MoEFFN(cfg).eval()
     with torch.no_grad():
-        for p in moe.get_submodule("routed").parameters():
+        for p in moe.get_submodule("routed_experts").parameters():
             p.zero_()  # every routed expert now outputs exactly 0
 
     x = torch.randn(2, 8, cfg.dim)
     out = moe(x)
     assert out.abs().sum() > 0
     # With routed experts silenced, the output is exactly the shared experts' sum.
-    shared = moe.get_submodule("shared").children()
-    torch.testing.assert_close(out, sum(expert(x) for expert in shared))
+    shared_experts = moe.get_submodule("shared_experts").children()
+    torch.testing.assert_close(out, sum(expert(x) for expert in shared_experts))
 
 
 def test_moeffn_routed_weights_are_unbiased_softmax() -> None:
@@ -430,12 +430,12 @@ def test_moeffn_routed_weights_are_unbiased_softmax() -> None:
     cfg = tiny_config(n_experts_per_tok=4)  # top-K covers all 4 experts
     moe = MoEFFN(cfg).eval()
     with torch.no_grad():
-        for p in moe.get_submodule("shared").parameters():
+        for p in moe.get_submodule("shared_experts").parameters():
             p.zero_()  # isolate the routed path
 
     x = torch.randn(2, 8, cfg.dim)
     weights = moe.get_submodule("router")(x).softmax(dim=-1)  # (B, T, n_experts)
-    experts = list(moe.get_submodule("routed").children())
+    experts = list(moe.get_submodule("routed_experts").children())
     expected = sum(
         weights[..., e : e + 1] * expert(x) for e, expert in enumerate(experts)
     )
@@ -443,6 +443,27 @@ def test_moeffn_routed_weights_are_unbiased_softmax() -> None:
 
     moe.get_buffer("router_bias").copy_(torch.tensor([5.0, -5.0, 0.0, 2.0]))
     torch.testing.assert_close(moe(x), expected, atol=1e-5, rtol=1e-4)
+
+
+def test_moeffn_topk_weights_renormalize_to_one() -> None:
+    """With top-2 of 4 experts, the chosen weights are renormalized to sum to 1.
+
+    Give every routed expert the same weights, so each token's routed output is
+    ``(w_1 + w_2) * expert(x)``. That equals ``expert(x)`` only if the top-K
+    weights were renormalized; raw softmax weights sum to less than 1.
+    """
+    torch.manual_seed(0)
+    cfg = tiny_config(n_experts_per_tok=2)
+    moe = MoEFFN(cfg).eval()
+    experts = list(moe.get_submodule("routed_experts").children())
+    with torch.no_grad():
+        for p in moe.get_submodule("shared_experts").parameters():
+            p.zero_()  # isolate the routed path
+        for expert in experts[1:]:
+            expert.load_state_dict(experts[0].state_dict())
+
+    x = torch.randn(2, 8, cfg.dim)
+    torch.testing.assert_close(moe(x), experts[0](x), atol=1e-5, rtol=1e-4)
 
 
 def test_moeffn_update_router_bias_moves_load_toward_balance() -> None:
