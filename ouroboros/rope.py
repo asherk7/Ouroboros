@@ -26,7 +26,8 @@ def precompute_rope_angles(
     m = torch.arange(max_len).float()
 
     # create our main theta, for every m, we have every inv_freq
-    # this can be applied to every token in a sequence (for every m, apply every inv_freq to pairs)
+    # this can be applied to every token in a sequence 
+    # for every m, we have every inv_freq to pairs (every index is m * inv_freq)
     angles = torch.outer(m, inv_freq) # (seq_len, num_pairs), num_pairs = dim/2
     return angles
 

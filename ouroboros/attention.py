@@ -85,7 +85,7 @@ class GQAttention(nn.Module):
         Returns:
             ``(B, T, dim)``.
         """
-        B, S, _ = x.shape
+        B, S, D = x.shape
 
         q = self.wq(x) # (batch, seq_len, head_dim * n_heads)
         k = self.wk(x) # (batch, seq_len, head_dim * kv_heads)
@@ -128,7 +128,6 @@ class GQAttention(nn.Module):
             out = F.scaled_dot_product_attention(q, k, v, is_causal=causal, enable_gqa=True, scale=self.scale)
             # this gives us the result from probs @ V
             # (batch, num_heads, seq_len, head_dim)
-
         else:
             # manual GQA implementation
             # give every query head its KV head: if we do matmul with the previous shapes, 
