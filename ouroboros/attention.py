@@ -105,6 +105,15 @@ class GQAttention(nn.Module):
         k = apply_rope(k, rope_angles)
 
         # KV cache
+        if kv_cache is not None:
+            # skips the cache during training since it's not needed/doesn't exist
+            if cache_key in kv_cache:
+                # if this layer already has a K/V matrix, store the new values at the end
+                # (batch, seq_len_so_far, n_kv_heads, head_dim) + (batch, 1, n_kv_heads, head_dim) 
+                # = (batch, seq_len + 1, n_kv_heads, head_dim)
+                k = torch.cat([kv_cache[cache_key]["k"], k], dim=1)
+                v = torch.cat([kv_cache[cache_key]["v"], v], dim=1)
+            kv_cache[cache_key] = {"k": k, "v": v} # either we store the updated, or the new KV values
 
         # attention
         # change shape to (batch, heads, seq_len, head_dim) so when we do matmul: 
