@@ -142,7 +142,7 @@ class RecurrentBlock(nn.Module):
         self,
         h: torch.Tensor,
         e: torch.Tensor,
-        freqs_cis: torch.Tensor,
+        rope_angles: torch.Tensor,
         causal: bool = True,
         n_loops: Optional[int] = None,
         kv_cache: Optional[dict] = None,
@@ -152,7 +152,7 @@ class RecurrentBlock(nn.Module):
         Args:
             h: Initial state, ``(B, T, dim)``. The model passes ``e``.
             e: Prelude output, re-injected every loop.
-            freqs_cis, causal: Passed to the block.
+            rope_angles, causal: Passed to the block.
             n_loops: ``None`` means ``cfg.mean_loops``.
             kv_cache: Optional cache dict.
 

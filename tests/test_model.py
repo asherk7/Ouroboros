@@ -59,7 +59,7 @@ def test_forward_single_token_T1() -> None:
 def test_forward_raises_past_max_seq_len() -> None:
     """``forward`` raises ``ValueError`` when ``start_pos + T > max_seq_len``.
 
-    Slicing ``freqs_cis`` past its end does not raise by itself, so the model
+    Slicing ``rope_angles`` past its end does not raise by itself, so the model
     must check; ``generate`` with a long prompt plus ``max_new_tokens`` is the
     realistic trigger.
     """

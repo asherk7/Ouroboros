@@ -38,7 +38,7 @@ from ouroboros import (  # noqa: F401
     TransformerBlock,
     apply_rope,
     loop_index_embedding,
-    precompute_rope_freqs,
+    precompute_rope_angles,
     sample_n_loops,
 )
 
@@ -73,9 +73,9 @@ def tiny_config(**overrides: Any) -> OuroborosConfig:
     return OuroborosConfig(**tiny)
 
 
-def tiny_freqs(cfg: OuroborosConfig) -> torch.Tensor:
-    """RoPE phasors for every position of ``cfg``, sized to the per-head width."""
-    return precompute_rope_freqs(
+def tiny_angles(cfg: OuroborosConfig) -> torch.Tensor:
+    """RoPE angles for every position of ``cfg``, sized to the per-head width."""
+    return precompute_rope_angles(
         cfg.dim // cfg.n_heads, cfg.max_seq_len, cfg.rope_theta
     )
 
@@ -177,19 +177,16 @@ def test_rmsnorm_weight_is_learnable_parameter() -> None:
 # ===========================================================================
 
 
-def test_precompute_rope_freqs_shape_and_complex_dtype() -> None:
-    """``precompute_rope_freqs`` returns ``complex64`` of shape ``(max_len, dim // 2)``."""
-    freqs = precompute_rope_freqs(16, 64)
-    assert freqs.shape == (64, 8)
-    assert freqs.dtype == torch.complex64
-    # Every phasor is a pure rotation (magnitude 1).
-    torch.testing.assert_close(freqs.abs(), torch.ones(64, 8))
-    # Entry [m, k] rotates by angle m * theta**(-2k / dim).
+def test_precompute_rope_angles_shape_and_values() -> None:
+    """``precompute_rope_angles`` returns ``float32`` of shape ``(max_len, dim // 2)``
+    with entry ``[m, k] = m * theta**(-2k / dim)``."""
+    angles = precompute_rope_angles(16, 64)
+    assert angles.shape == (64, 8)
+    assert angles.dtype == torch.float32
+    # Position 0 never rotates.
+    torch.testing.assert_close(angles[0], torch.zeros(8))
     m, k = 5, 3
-    angle = m * 10000.0 ** (-2 * k / 16)
-    torch.testing.assert_close(
-        freqs[m, k], torch.tensor(complex(math.cos(angle), math.sin(angle)))
-    )
+    torch.testing.assert_close(angles[m, k], torch.tensor(m * 10000.0 ** (-2 * k / 16)))
 
 
 def test_apply_rope_rotates_adjacent_pairs() -> None:
@@ -200,44 +197,44 @@ def test_apply_rope_rotates_adjacent_pairs() -> None:
     A "rotate half" implementation (pairing ``k`` with ``k + head_dim // 2``)
     fails this.
     """
-    freqs = precompute_rope_freqs(16, 64)
+    angles = precompute_rope_angles(16, 64)
     m = 3
     x = torch.zeros(1, 1, 1, 16)
     x[..., 0] = 1.0
     expected = torch.zeros(1, 1, 1, 16)
     expected[..., 0], expected[..., 1] = math.cos(m), math.sin(m)
-    torch.testing.assert_close(apply_rope(x, freqs[m : m + 1]), expected)
+    torch.testing.assert_close(apply_rope(x, angles[m : m + 1]), expected)
 
 
 def test_apply_rope_preserves_shape() -> None:
     """``apply_rope`` keeps the ``(B, T, H, head_dim)`` shape and dtype."""
-    freqs = precompute_rope_freqs(16, 64)
+    angles = precompute_rope_angles(16, 64)
     x = torch.randn(2, 8, 4, 16)
-    out = apply_rope(x, freqs[:8])
+    out = apply_rope(x, angles[:8])
     assert out.shape == x.shape
     assert out.dtype == x.dtype
 
     # Low precision input comes back in low precision (fp32 rotation is internal).
-    assert apply_rope(x.to(torch.bfloat16), freqs[:8]).dtype == torch.bfloat16
+    assert apply_rope(x.to(torch.bfloat16), angles[:8]).dtype == torch.bfloat16
 
 
 def test_apply_rope_preserves_norm() -> None:
     """RoPE is a rotation: each head vector keeps its L2 norm."""
     torch.manual_seed(0)
-    freqs = precompute_rope_freqs(16, 64)
+    angles = precompute_rope_angles(16, 64)
     x = torch.randn(2, 32, 4, 16)
-    out = apply_rope(x, freqs[:32])
+    out = apply_rope(x, angles[:32])
     torch.testing.assert_close(out.norm(dim=-1), x.norm(dim=-1))
 
 
 def test_apply_rope_position_zero_is_identity() -> None:
-    """With ``freqs_cis`` sliced to position 0 only, the input comes back unchanged."""
-    freqs = precompute_rope_freqs(16, 64)
+    """With ``rope_angles`` sliced to position 0 only, the input comes back unchanged."""
+    angles = precompute_rope_angles(16, 64)
     x = torch.randn(2, 1, 4, 16)
-    torch.testing.assert_close(apply_rope(x, freqs[:1]), x)
+    torch.testing.assert_close(apply_rope(x, angles[:1]), x)
 
     # Guard: position 1 must actually rotate, so a do-nothing apply_rope fails.
-    assert not torch.allclose(apply_rope(x, freqs[1:2]), x)
+    assert not torch.allclose(apply_rope(x, angles[1:2]), x)
 
 
 def test_apply_rope_dot_product_depends_only_on_relative_position() -> None:
@@ -247,12 +244,12 @@ def test_apply_rope_dot_product_depends_only_on_relative_position() -> None:
     times, so their attention logit must be the same. At (5, 1) it must differ.
     """
     torch.manual_seed(0)
-    freqs = precompute_rope_freqs(16, 64)
+    angles = precompute_rope_angles(16, 64)
     q = torch.randn(1, 1, 1, 16)
     k = torch.randn(1, 1, 1, 16)
 
     def logit(m: int, n: int) -> torch.Tensor:
-        return (apply_rope(q, freqs[m : m + 1]) * apply_rope(k, freqs[n : n + 1])).sum()
+        return (apply_rope(q, angles[m : m + 1]) * apply_rope(k, angles[n : n + 1])).sum()
 
     torch.testing.assert_close(logit(5, 2), logit(13, 10), atol=1e-4, rtol=1e-4)
     assert not torch.allclose(logit(5, 2), logit(5, 1))
@@ -292,13 +289,13 @@ def test_gqattention_output_shape() -> None:
     cfg = tiny_config()
     attn = GQAttention(cfg)
     x = torch.randn(2, 8, cfg.dim)
-    assert attn(x, tiny_freqs(cfg)[:8]).shape == (2, 8, cfg.dim)
+    assert attn(x, tiny_angles(cfg)[:8]).shape == (2, 8, cfg.dim)
     assert isinstance(attn.q_norm, RMSNorm) and isinstance(attn.k_norm, RMSNorm)
 
 
 def test_gqattention_uses_rope() -> None:
-    """Shifting every position (same input, ``freqs_cis[5:13]`` instead of ``[:8]``)
-    leaves the output unchanged, but scrambling the phasors changes it.
+    """Shifting every position (same input, ``rope_angles[5:13]`` instead of ``[:8]``)
+    leaves the output unchanged, but scrambling the angles changes it.
 
     The first half holds because attention only sees relative offsets. The
     second half fails if RoPE is never applied.
@@ -306,11 +303,11 @@ def test_gqattention_uses_rope() -> None:
     torch.manual_seed(0)
     cfg = tiny_config()
     attn = GQAttention(cfg).eval()
-    freqs = tiny_freqs(cfg)
+    angles = tiny_angles(cfg)
     x = torch.randn(2, 8, cfg.dim)
-    out = attn(x, freqs[:8])
-    torch.testing.assert_close(attn(x, freqs[5:13]), out, atol=1e-5, rtol=1e-4)
-    assert not torch.allclose(attn(x, freqs[:8].flip(0)), out)
+    out = attn(x, angles[:8])
+    torch.testing.assert_close(attn(x, angles[5:13]), out, atol=1e-5, rtol=1e-4)
+    assert not torch.allclose(attn(x, angles[:8].flip(0)), out)
 
 
 def test_gqattention_sdpa_matches_manual() -> None:
@@ -319,10 +316,10 @@ def test_gqattention_sdpa_matches_manual() -> None:
     cfg = tiny_config()
     attn = GQAttention(cfg).eval()
     x = torch.randn(2, 8, cfg.dim)
-    freqs = tiny_freqs(cfg)[:8]
+    angles = tiny_angles(cfg)[:8]
     for causal in (True, False):
-        sdpa = attn(x, freqs, causal=causal, use_sdpa=True)
-        manual = attn(x, freqs, causal=causal, use_sdpa=False)
+        sdpa = attn(x, angles, causal=causal, use_sdpa=True)
+        manual = attn(x, angles, causal=causal, use_sdpa=False)
         torch.testing.assert_close(sdpa, manual, atol=1e-5, rtol=1e-4)
 
 
@@ -331,14 +328,14 @@ def test_gqattention_causal_blocks_future() -> None:
     torch.manual_seed(0)
     cfg = tiny_config()
     attn = GQAttention(cfg).eval()
-    freqs = tiny_freqs(cfg)[:8]
+    angles = tiny_angles(cfg)[:8]
     x = torch.randn(2, 8, cfg.dim)
     x_changed = x.clone()
     x_changed[:, 5:] = torch.randn(2, 3, cfg.dim)  # change only the future
 
     for use_sdpa in (True, False):
-        out = attn(x, freqs, use_sdpa=use_sdpa)
-        out_changed = attn(x_changed, freqs, use_sdpa=use_sdpa)
+        out = attn(x, angles, use_sdpa=use_sdpa)
+        out_changed = attn(x_changed, angles, use_sdpa=use_sdpa)
         torch.testing.assert_close(out[:, :5], out_changed[:, :5])
         # Guard: the changed positions do change, so the comparison means something.
         assert not torch.allclose(out[:, 5:], out_changed[:, 5:])
@@ -348,16 +345,16 @@ def test_gqattention_kv_cache_accumulates() -> None:
     """After a length-``T`` prefill and one decode step, cached k/v have length ``T + 1``."""
     cfg = tiny_config()
     attn = GQAttention(cfg).eval()
-    freqs = tiny_freqs(cfg)
+    angles = tiny_angles(cfg)
     head_dim = cfg.dim // cfg.n_heads
     cache: dict = {}
 
-    attn(torch.randn(2, 8, cfg.dim), freqs[:8], causal=True, kv_cache=cache)
+    attn(torch.randn(2, 8, cfg.dim), angles[:8], causal=True, kv_cache=cache)
     # Stored per KV head (n_kv_heads), not expanded to n_heads.
     assert cache["default"]["k"].shape == (2, 8, cfg.n_kv_heads, head_dim)
     assert cache["default"]["v"].shape == (2, 8, cfg.n_kv_heads, head_dim)
 
-    attn(torch.randn(2, 1, cfg.dim), freqs[8:9], causal=False, kv_cache=cache)
+    attn(torch.randn(2, 1, cfg.dim), angles[8:9], causal=False, kv_cache=cache)
     assert cache["default"]["k"].shape == (2, 9, cfg.n_kv_heads, head_dim)
     assert cache["default"]["v"].shape == (2, 9, cfg.n_kv_heads, head_dim)
 
@@ -372,14 +369,14 @@ def test_gqattention_cached_decode_matches_one_shot() -> None:
     torch.manual_seed(0)
     cfg = tiny_config()
     attn = GQAttention(cfg).eval()
-    freqs = tiny_freqs(cfg)
+    angles = tiny_angles(cfg)
     x = torch.randn(2, 8, cfg.dim)
 
-    full = attn(x, freqs[:8], causal=True)
+    full = attn(x, angles[:8], causal=True)
 
     cache: dict = {}
     steps = [
-        attn(x[:, t : t + 1], freqs[t : t + 1], causal=False, kv_cache=cache)
+        attn(x[:, t : t + 1], angles[t : t + 1], causal=False, kv_cache=cache)
         for t in range(8)
     ]
     torch.testing.assert_close(torch.cat(steps, dim=1), full, atol=1e-5, rtol=1e-4)
@@ -490,11 +487,11 @@ def test_transformer_block_dense_and_moe_shapes() -> None:
     """Both ``use_moe=False`` and ``use_moe=True`` blocks map ``(B, T, dim)`` to ``(B, T, dim)``."""
     cfg = tiny_config()
     x = torch.randn(2, 8, cfg.dim)
-    freqs = tiny_freqs(cfg)[:8]
+    angles = tiny_angles(cfg)[:8]
     for use_moe, ffn_type in ((False, FeedForward), (True, MoEFFN)):
         block = TransformerBlock(cfg, use_moe=use_moe)
         assert isinstance(block.ffn, ffn_type)
-        assert block(x, freqs).shape == (2, 8, cfg.dim)
+        assert block(x, angles).shape == (2, 8, cfg.dim)
 
 
 def test_transformer_block_residuals() -> None:
@@ -510,7 +507,7 @@ def test_transformer_block_residuals() -> None:
         block.get_parameter("attn.wo.weight").zero_()
         block.get_parameter("ffn.down.weight").zero_()
     x = torch.randn(2, 8, cfg.dim)
-    torch.testing.assert_close(block(x, tiny_freqs(cfg)[:8]), x)
+    torch.testing.assert_close(block(x, tiny_angles(cfg)[:8]), x)
 
 
 # ===========================================================================

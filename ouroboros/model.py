@@ -16,13 +16,13 @@ from .block import TransformerBlock  # noqa: F401
 from .config import OuroborosConfig
 from .norm import RMSNorm  # noqa: F401
 from .recurrence import RecurrentBlock  # noqa: F401
-from .rope import precompute_rope_freqs  # noqa: F401
+from .rope import precompute_rope_angles  # noqa: F401
 
 
 class Ouroboros(nn.Module):
     """Recurrent-depth transformer language model.
 
-    Submodules: ``embed`` (weight-tied to ``head``), ``freqs_cis`` buffer,
+    Submodules: ``embed`` (weight-tied to ``head``), ``rope_angles`` buffer,
     ``prelude`` and ``coda`` (dense blocks), ``recurrent``, ``norm``, ``head``.
     Also stores ``self.cfg``.
     """
@@ -49,7 +49,7 @@ class Ouroboros(nn.Module):
     ) -> torch.Tensor:
         """Embed, run Prelude, Recurrent, and Coda, then the tied head.
 
-        Slice ``freqs_cis[start_pos : start_pos + T]``, use ``causal = T > 1``, and
+        Slice ``rope_angles[start_pos : start_pos + T]``, use ``causal = T > 1``, and
         cache keys ``prelude_{i}`` / ``coda_{i}``. The recurrent block starts from
         ``h = e = x``.
 

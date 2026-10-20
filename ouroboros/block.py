@@ -36,7 +36,7 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
+        rope_angles: torch.Tensor,
         causal: bool = True,
         kv_cache: Optional[dict] = None,
         cache_key: str = "default",
@@ -45,7 +45,7 @@ class TransformerBlock(nn.Module):
 
         Args:
             x: ``(B, T, dim)``.
-            freqs_cis, causal, kv_cache, cache_key: Passed through to attention.
+            rope_angles, causal, kv_cache, cache_key: Passed through to attention.
 
         Returns:
             ``(B, T, dim)``.

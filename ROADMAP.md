@@ -50,7 +50,7 @@ feed-forward layer.
 How rotating queries and keys encodes relative position.
 
 **Read**
-- [Rotary Embeddings: A Relative Revolution](https://blog.eleuther.ai/rotary-embeddings/) (EleutherAI, 2021). READ: the intuition and the complex-number view.
+- [Rotary Embeddings: A Relative Revolution](https://blog.eleuther.ai/rotary-embeddings/) (EleutherAI, 2021). READ: the intuition (Ouroboros uses the rotation-matrix view, not complex numbers).
 - [RoFormer](https://arxiv.org/abs/2104.09864) (Su et al., 2021). SKIM the derivation: why relative position falls out of the dot product.
 
 **Build:** `precompute_rope_freqs`, `apply_rope`.

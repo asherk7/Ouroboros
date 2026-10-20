@@ -20,7 +20,7 @@ from .recurrence import (
     loop_index_embedding,
     sample_n_loops,
 )
-from .rope import apply_rope, precompute_rope_freqs
+from .rope import apply_rope, precompute_rope_angles
 
 # Single-source the version from pyproject.toml package metadata; fall back for
 # the from-source (not pip-installed) case.
@@ -34,7 +34,7 @@ __all__ = [
     "OuroborosConfig",
     # Primitives
     "RMSNorm",
-    "precompute_rope_freqs",
+    "precompute_rope_angles",
     "apply_rope",
     # Attention
     "GQAttention",
