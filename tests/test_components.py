@@ -1,8 +1,8 @@
 """Unit tests for the individual Ouroboros components.
 
 Each test names the property it checks and states the assertion in its
-docstring. Sections 2 to 7 have real bodies and fail until the component is
-implemented; later sections still skip with ``pytest.skip("stub: section N")``. Section numbers follow ``ROADMAP.md``:
+docstring. Sections 2 to 8 have real bodies and fail until the component is
+implemented. Section numbers follow ``ROADMAP.md``:
 
 * Section 2: ``RMSNorm``, ``FeedForward`` (SwiGLU).
 * Section 3: RoPE.
@@ -13,7 +13,7 @@ implemented; later sections still skip with ``pytest.skip("stub: section N")``. 
   ``RecurrentBlock``.
 
 The imports are part of the contract: renaming or removing a public name fails
-collection even while every body is a skip.
+collection.
 """
 
 from __future__ import annotations
@@ -26,8 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Section 8 names are referenced only inside skipped bodies, so F401 is suppressed.
-from ouroboros import (  # noqa: F401
+from ouroboros import (
     FeedForward,
     GQAttention,
     LTIInjection,
@@ -538,12 +537,20 @@ def test_transformer_block_residuals() -> None:
 
 def test_loop_index_embedding_differs_per_iteration() -> None:
     """``loop_t=0`` and ``loop_t=1`` give different outputs for the same ``h``."""
-    pytest.skip("stub: section 8")
+    h = torch.randn(2, 8, 64)
+    out0 = loop_index_embedding(h, loop_t=0, loop_dim=8)
+    out1 = loop_index_embedding(h, loop_t=1, loop_dim=8)
+    assert not torch.allclose(out0, out1)
 
 
 def test_loop_index_embedding_only_modifies_first_loop_dim_channels() -> None:
     """Channels ``loop_dim:`` equal the input exactly; shape is unchanged."""
-    pytest.skip("stub: section 8")
+    h = torch.randn(2, 8, 64)
+    out = loop_index_embedding(h, loop_t=3, loop_dim=8)
+    assert out.shape == h.shape
+    assert out.dtype == h.dtype
+    torch.testing.assert_close(out[..., 8:], h[..., 8:], rtol=0, atol=0)
+    assert not torch.allclose(out[..., :8], h[..., :8])
 
 
 def test_sample_n_loops_range_and_mean() -> None:
@@ -553,12 +560,20 @@ def test_sample_n_loops_range_and_mean() -> None:
     and 8; each mean should be within about 5% of ``mean_loops`` and the max
     well above it (heavy tail). ``mean_loops=1`` always returns 1.
     """
-    pytest.skip("stub: section 8")
+    g = torch.Generator().manual_seed(0)
+    for mean_loops in (4, 8):
+        samples = [sample_n_loops(mean_loops, generator=g) for _ in range(4000)]
+        assert all(isinstance(n, int) and n >= 1 for n in samples)
+        assert abs(sum(samples) / len(samples) - mean_loops) < 0.05 * mean_loops
+        assert max(samples) >= 2 * mean_loops
+    assert all(sample_n_loops(1, generator=g) == 1 for _ in range(50))
 
 
 def test_lti_injection_get_A_strictly_between_zero_and_one() -> None:
     """``get_A()`` is ``(dim,)`` with every entry in ``(0, 1)``."""
-    pytest.skip("stub: section 8")
+    A = LTIInjection(64).get_A()
+    assert A.shape == (64,)
+    assert (A > 0).all() and (A < 1).all()
 
 
 def test_lti_injection_spectral_radius_stays_below_one_after_huge_step() -> None:
@@ -568,34 +583,110 @@ def test_lti_injection_spectral_radius_stays_below_one_after_huge_step() -> None
     ``get_A()`` in fp32 is finite, NaN-free, and strictly inside ``(0, 1)``
     (``max < 1`` and ``min > 0``); the ``clamp(-12, 4)`` is what guarantees it.
     """
-    pytest.skip("stub: section 8")
+    for step in (1e4, -1e4):
+        inj = LTIInjection(64)
+        with torch.no_grad():
+            inj.log_A.add_(step)
+            inj.log_dt.add_(step)
+        A = inj.get_A()
+        assert A.dtype == torch.float32
+        assert torch.isfinite(A).all()
+        assert A.max() < 1 and A.min() > 0
+
+
+def test_lti_injection_forward_matches_formula() -> None:
+    """``forward(h, e, r)`` equals ``A * h + B * e + r`` elementwise."""
+    inj = LTIInjection(64)
+    h, e, r = (torch.randn(2, 8, 64) for _ in range(3))
+    torch.testing.assert_close(inj(h, e, r), inj.get_A() * h + inj.B * e + r)
 
 
 def test_recurrent_block_output_shape_and_single_loop() -> None:
     """``RecurrentBlock`` returns ``(B, T, dim)`` for ``n_loops=1`` and ``n_loops=4``."""
-    pytest.skip("stub: section 8")
+    cfg = tiny_config()
+    block = RecurrentBlock(cfg).eval()
+    e = torch.randn(2, 8, cfg.dim)
+    angles = tiny_angles(cfg)[:8]
+    for n_loops in (1, 4):
+        assert block(e, e, angles, n_loops=n_loops).shape == (2, 8, cfg.dim)
 
 
 def test_recurrent_block_more_loops_changes_output() -> None:
     """``n_loops=2`` and ``n_loops=4`` give different outputs on the same input."""
-    pytest.skip("stub: section 8")
+    cfg = tiny_config()
+    block = RecurrentBlock(cfg).eval()
+    e = torch.randn(2, 8, cfg.dim)
+    angles = tiny_angles(cfg)[:8]
+    with torch.no_grad():
+        out2 = block(e, e, angles, n_loops=2)
+        out4 = block(e, e, angles, n_loops=4)
+    assert not torch.allclose(out2, out4)
+
+
+def test_recurrent_block_one_loop_matches_lti_formula() -> None:
+    """One loop is ``A*h + B*e + R(h, e)`` with ``R = block(combined) - combined``.
+
+    ``R`` is the shared block's change to ``combined``, not its full output, so
+    the residual's copy of ``combined`` must not leak into the update.
+    """
+    cfg = tiny_config()
+    rb = RecurrentBlock(cfg).eval()
+    assert rb.injection is not None
+    h, e = torch.randn(2, 8, cfg.dim), torch.randn(2, 8, cfg.dim)
+    angles = tiny_angles(cfg)[:8]
+    with torch.no_grad():
+        combined = rb.norm(loop_index_embedding(h, 0, rb.loop_dim) + e)
+        r = rb.block(combined, angles) - combined
+        expected = rb.injection.get_A() * h + rb.injection.B * e + r
+        torch.testing.assert_close(rb(h, e, angles, n_loops=1), expected)
 
 
 def test_recurrent_block_naive_arm() -> None:
     """``use_lti=False`` builds no ``LTIInjection`` and still runs the loop.
 
-    ``block.injection is None``, the update is ``h = trans + e``, and the output
-    is ``(B, T, dim)``.
+    ``block.injection is None``, the update is
+    ``h = TransformerBlock(combined) + e``, and the output is ``(B, T, dim)``.
     """
-    pytest.skip("stub: section 8")
+    cfg = tiny_config(use_lti=False)
+    rb = RecurrentBlock(cfg).eval()
+    assert rb.injection is None
+    h, e = torch.randn(2, 8, cfg.dim), torch.randn(2, 8, cfg.dim)
+    angles = tiny_angles(cfg)[:8]
+    with torch.no_grad():
+        combined = rb.norm(loop_index_embedding(h, 0, rb.loop_dim) + e)
+        torch.testing.assert_close(
+            rb(h, e, angles, n_loops=1), rb.block(combined, angles) + e
+        )
+        assert rb(e, e, angles, n_loops=4).shape == (2, 8, cfg.dim)
 
 
 def test_recurrent_block_truncated_backprop() -> None:
     """Truncated backprop changes gradients, not values.
 
     In train mode with ``n_loops=6`` and ``backprop_loops=2``: the output equals
-    the output computed under ``torch.no_grad()`` (same values), and
-    ``backward()`` still produces gradients for the block's parameters and for
+    the output computed under ``torch.no_grad()`` (same values), only the last
+    2 loops build a graph, and ``backward()`` still produces gradients for the block's parameters and for
     ``e``.
     """
-    pytest.skip("stub: section 8")
+    cfg = tiny_config(backprop_loops=2)
+    rb = RecurrentBlock(cfg).train()
+    assert rb.injection is not None
+    e = torch.randn(2, 8, cfg.dim, requires_grad=True)
+    angles = tiny_angles(cfg)[:8]
+
+    with torch.no_grad():
+        ref = rb(e, e, angles, n_loops=6)
+
+    # record whether each loop's block call builds a graph
+    grad_on: list[bool] = []
+    rb.block.register_forward_pre_hook(
+        lambda *_: grad_on.append(torch.is_grad_enabled())
+    )
+    out = rb(e, e, angles, n_loops=6)
+    torch.testing.assert_close(out, ref)
+    assert grad_on == [False] * 4 + [True] * 2
+
+    out.sum().backward()
+    assert e.grad is not None and e.grad.abs().sum() > 0
+    assert rb.injection.log_A.grad is not None
+    assert rb.block.get_parameter("attn.wo.weight").grad is not None

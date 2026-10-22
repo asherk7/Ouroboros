@@ -31,8 +31,8 @@ Transformers (Dehghani et al., 2018).
  │  for t in range(n_loops):        # training: n_loops is random │
  │    h_loop   = loop_index_embedding(h, t, loop_dim)             │
  │    combined = RMSNorm(h_loop + e)                              │
- │    trans    = TransformerBlock(combined)   # GQA + MoE         │
- │    h        = A*h + B*e + trans            # LTIInjection      │
+ │    R        = TransformerBlock(combined) - combined  # R(h, e) │
+ │    h        = A*h + B*e + R                # LTIInjection      │
  │  (training: gradients flow through the last backprop_loops)    │
  └────────────────────────────────────────────────────────────────┘
       │  x := h (B, T, dim)
@@ -60,7 +60,7 @@ specialize in refinement, and gives the injected `e` a stable encoded space.
 ## 2. The LTI recurrence
 
 ```
- h_{t+1} = A * h_t  +  B * e  +  Transformer(h_t, e)        with  ρ(A) < 1
+ h_{t+1} = A * h_t  +  B * e  +  R(h_t, e)        with  ρ(A) < 1
 ```
 
 - `A` is a learned diagonal with every entry in `(0, 1)`, so
@@ -68,7 +68,9 @@ specialize in refinement, and gives the injected `e` a stable encoded space.
   contraction: perturbations shrink across loops instead of compounding.
 - `B * e` re-injects the frozen input every loop, so the prompt is never lost
   however deep the loop runs.
-- `Transformer(h_t, e)` is the nonlinear refinement at this loop.
+- `R(h_t, e)` is the nonlinear refinement at this loop: the shared block's
+  change to its input, `TransformerBlock(combined) - combined`, not its full
+  output.
 
 ---
 
@@ -225,7 +227,7 @@ the same kind of timestep signal.
 
 ### LTI injection
 
-Parcae's update `h = A·h + B·e + Transformer(h, e)` borrows from state-space
+Parcae's update `h = A·h + B·e + R(h, e)` borrows from state-space
 models. `A` is built as a discretized continuous-time system with a strictly
 negative rate:
 
@@ -243,7 +245,7 @@ loop would only hide that; this removes it. `ρ(A)` is also a free stability
 readout to log during training.
 
 The comparison arm for the stability metric replaces this update with the
-naive `h = Transformer(h, e) + e`: no `A`, no `B`, no guarantee.
+naive `h = TransformerBlock(combined) + e`: no `A`, no `B`, no guarantee.
 
 ### Training: random loop count and truncated backprop
 

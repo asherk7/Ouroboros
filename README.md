@@ -56,8 +56,8 @@ the code makes the reading concrete. The papers behind it are in the
  │  for t in range(n_loops):        # training: n_loops is random │
  │    h_loop   = loop_index_embedding(h, t, loop_dim)             │
  │    combined = RMSNorm(h_loop + e)                              │
- │    trans    = TransformerBlock(combined)   # GQA + MoE         │
- │    h        = A*h + B*e + trans            # LTIInjection      │
+ │    R        = TransformerBlock(combined) - combined  # R(h, e) │
+ │    h        = A*h + B*e + R                # LTIInjection      │
  └────────────────────────────────────────────────────────────────┘
       │  x := h (B, T, dim)
       ▼
@@ -73,7 +73,7 @@ the code makes the reading concrete. The papers behind it are in the
 The stability core is the LTI recurrence
 
 ```
-h_{t+1} = A · h_t + B · e + Transformer(h_t, e),   with   ρ(A) < 1.
+h_{t+1} = A · h_t + B · e + R(h_t, e),   with   ρ(A) < 1.
 ```
 
 `A` is a diagonal state matrix discretized by zero-order hold from

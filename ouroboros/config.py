@@ -37,7 +37,7 @@ class OuroborosConfig:
     backprop_loops: int = 4
     # channels receiving the loop-index embedding; None -> see loop_dim
     loop_index_dim: Optional[int] = None
-    # LTI-stable injection. False swaps in the naive update h = trans + e: the
+    # LTI-stable injection. False swaps in the naive update h = block(combined) + e: the
     # comparison arm for the stability metric (ROADMAP section 11)
     use_lti: bool = True
 
