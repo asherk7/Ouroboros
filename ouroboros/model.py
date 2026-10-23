@@ -151,7 +151,9 @@ class Ouroboros(nn.Module):
         for _ in range(max_new_tokens):
             if use_cache and ids.shape[1] > input_ids.shape[1]:
                 # decode: only the newest token; the cache holds everything before it
-                logits = self(ids[:, -1:], n_loops, kv_cache, start_pos=ids.shape[1] - 1)
+                logits = self(
+                    ids[:, -1:], n_loops, kv_cache, start_pos=ids.shape[1] - 1
+                )
             else:
                 # prefill (cache) or full rerun (no cache)
                 logits = self(ids, n_loops, kv_cache)
