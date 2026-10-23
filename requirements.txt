@@ -3,7 +3,7 @@
 # Pins are loose / lower-bounded to stay Colab-compatible.
 
 # --- Core ---
-torch>=2.1            # includes F.scaled_dot_product_attention
+torch>=2.3            # includes F.scaled_dot_product_attention
 numpy
 
 # --- Data + tokenization ---

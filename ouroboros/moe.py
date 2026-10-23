@@ -29,6 +29,10 @@ class MoEFFN(nn.Module):
     :meth:`update_router_bias`.
     """
 
+    # buffers; annotated so mypy knows they're tensors
+    router_bias: torch.Tensor
+    expert_load: torch.Tensor
+
     def __init__(self, cfg: OuroborosConfig) -> None:
         """Build the router, experts, and buffers.
 

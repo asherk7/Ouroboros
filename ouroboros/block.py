@@ -39,6 +39,7 @@ class TransformerBlock(nn.Module):
         self.attn_norm = RMSNorm(dim=cfg.dim, eps=cfg.norm_eps)
         self.attn_dropout = nn.Dropout(cfg.dropout)
 
+        self.ffn: MoEFFN | FeedForward
         if use_moe:
             self.ffn = MoEFFN(cfg)
         else:

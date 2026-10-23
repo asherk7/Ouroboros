@@ -28,7 +28,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "torch>=2.1",
+    "torch>=2.3",
     "numpy",
     "datasets",
     "transformers",
@@ -58,3 +58,8 @@ testpaths = ["tests"]
 
 [tool.mypy]
 python_version = "3.10"
+
+# these ship without type information
+[[tool.mypy.overrides]]
+module = ["datasets", "tokenizers"]
+ignore_missing_imports = true
