@@ -7,8 +7,6 @@ the cache each step processes one token. In a looped model the cache holds one
 entry per loop iteration, so the saving is paid for in memory that grows with
 ``n_loops`` (see ``ARCHITECTURE.md`` section 5).
 
-A stub: bodies raise ``NotImplementedError``.
-
 Usage:
 .. code-block:: bash
 
@@ -18,6 +16,18 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import statistics
+import time
+
+import torch
+
+from training.train import load_model
+
+
+def sync(device: str) -> None:
+    """Wait for queued GPU work, so the clock measures the work, not the launch."""
+    if device == "cuda":
+        torch.cuda.synchronize()
 
 
 def time_generate(
@@ -30,12 +40,10 @@ def time_generate(
 ) -> float:
     """Return decode throughput in generated tokens per second.
 
-    Load the model from the checkpoint (configs are stored as dicts; rebuild
-    with ``OuroborosConfig(**ckpt["model_cfg"])``). Use a fixed batch of
-    prompts. Do one untimed warmup call, then time ``repeats`` calls to
-    ``generate(..., use_cache=use_cache)``. On CUDA, call
-    ``torch.cuda.synchronize()`` before reading the clock on both ends. Report
-    the median.
+    Loads the model from the checkpoint and uses one fixed random prompt
+    (batch 1: a single user decoding). One untimed warmup call, then ``repeats``
+    timed calls to ``generate(..., use_cache=use_cache)``; on CUDA,
+    ``torch.cuda.synchronize()`` runs before reading the clock on both ends.
 
     Args:
         ckpt_path: Checkpoint from ``training/train.py``.
@@ -48,14 +56,45 @@ def time_generate(
     Returns:
         Median tokens per second.
     """
-    raise NotImplementedError
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, _ = load_model(ckpt_path, device)
+    # content doesn't matter for timing; the work per token is the same
+    gen = torch.Generator().manual_seed(0)
+    prompt = torch.randint(0, model.cfg.vocab_size, (1, prompt_len), generator=gen)
+    prompt = prompt.to(device)
+
+    def run() -> None:
+        model.generate(prompt, max_new_tokens, n_loops=n_loops, use_cache=use_cache)
+
+    run()  # warmup: CUDA kernel selection and allocator growth happen here
+    rates = []
+    for _ in range(repeats):
+        sync(device)
+        t0 = time.perf_counter()
+        run()
+        sync(device)
+        rates.append(max_new_tokens / (time.perf_counter() - t0))
+    # median: one slow call (a GC pause, another process) doesn't skew it
+    return statistics.median(rates)
 
 
 def main() -> None:
     """Parse ``--ckpt``, time both settings, print both rates and the speedup."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ckpt", required=True)
-    raise NotImplementedError
+    parser.add_argument("--n-loops", type=int, default=8)
+    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--repeats", type=int, default=5)
+    args = parser.parse_args()
+
+    kw = dict(
+        n_loops=args.n_loops, max_new_tokens=args.max_new_tokens, repeats=args.repeats
+    )
+    cached = time_generate(args.ckpt, use_cache=True, **kw)
+    print(f"with cache:    {cached:.1f} tokens/s", flush=True)
+    uncached = time_generate(args.ckpt, use_cache=False, **kw)
+    print(f"without cache: {uncached:.1f} tokens/s")
+    print(f"speedup: {cached / uncached:.2f}x ({args.n_loops} loops)")
 
 
 if __name__ == "__main__":

@@ -457,6 +457,17 @@ def load_checkpoint(
     return int(ckpt["step"])
 
 
+def load_model(path: str, device: str) -> Tuple[Ouroboros, dict]:
+    """Rebuild a trained model from a checkpoint, in eval mode (for the metric scripts).
+
+    Returns the model and the raw checkpoint dict (``model_cfg``, ``train_cfg``, ...).
+    """
+    ckpt = torch.load(path, map_location=device, weights_only=True)
+    model = Ouroboros(OuroborosConfig(**ckpt["model_cfg"])).to(device)
+    model.load_state_dict(ckpt["model"])
+    return model.eval(), ckpt
+
+
 # ---------------------------------------------------------------------------
 # Train loop and evaluation
 # ---------------------------------------------------------------------------
