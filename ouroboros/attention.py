@@ -12,6 +12,7 @@ from .config import OuroborosConfig
 from .norm import RMSNorm
 from .rope import apply_rope
 
+
 class GQAttention(nn.Module):
     """Grouped Query Attention with QK-norm and an optional KV cache.
 
@@ -41,11 +42,11 @@ class GQAttention(nn.Module):
         self.dim = cfg.dim
         self.n_heads = cfg.n_heads
         self.kv_heads = cfg.n_kv_heads
-        self.q_groupsize = self.n_heads//self.kv_heads
+        self.q_groupsize = self.n_heads // self.kv_heads
 
         # get the head dimensions
         self.head_dim = self.dim // self.n_heads
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
 
         # initialize norm & rope
         self.eps = cfg.norm_eps
@@ -87,13 +88,13 @@ class GQAttention(nn.Module):
         """
         B, S, D = x.shape
 
-        q = self.wq(x) # (batch, seq_len, head_dim * n_heads)
-        k = self.wk(x) # (batch, seq_len, head_dim * kv_heads)
+        q = self.wq(x)  # (batch, seq_len, head_dim * n_heads)
+        k = self.wk(x)  # (batch, seq_len, head_dim * kv_heads)
         v = self.wv(x)
 
         # turn each one into (batch, seq_len, heads, head_dim), split the combined heads
-        q = q.view(B, S, self.n_heads, self.head_dim) 
-        k = k.view(B, S, self.kv_heads, self.head_dim) 
+        q = q.view(B, S, self.n_heads, self.head_dim)
+        k = k.view(B, S, self.kv_heads, self.head_dim)
         v = v.view(B, S, self.kv_heads, self.head_dim)
 
         # QK-norm
@@ -109,28 +110,33 @@ class GQAttention(nn.Module):
             # skips the cache during training since it's not needed/doesn't exist
             if cache_key in kv_cache:
                 # if this layer already has a K/V matrix, store the new values at the end
-                # (batch, seq_len_so_far, n_kv_heads, head_dim) + (batch, 1, n_kv_heads, head_dim) 
+                # (batch, seq_len_so_far, n_kv_heads, head_dim) + (batch, 1, n_kv_heads, head_dim)
                 # = (batch, seq_len + 1, n_kv_heads, head_dim)
                 k = torch.cat([kv_cache[cache_key]["k"], k], dim=1)
                 v = torch.cat([kv_cache[cache_key]["v"], v], dim=1)
-            kv_cache[cache_key] = {"k": k, "v": v} # either we store the updated, or the new KV values
+            kv_cache[cache_key] = {
+                "k": k,
+                "v": v,
+            }  # either we store the updated, or the new KV values
 
         # attention
-        # change shape to (batch, heads, seq_len, head_dim) so when we do matmul: 
+        # change shape to (batch, heads, seq_len, head_dim) so when we do matmul:
         # (seq_len, head_dim) * (head_dim, seq_len)
         # matmul works on the last 2 dimensions, so it will do this for every batch & head
         q = q.transpose(1, 2)
-        k = k.transpose(1, 2) 
+        k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
         # proceed with attention
         if use_sdpa:
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=causal, enable_gqa=True, scale=self.scale)
+            out = F.scaled_dot_product_attention(
+                q, k, v, is_causal=causal, enable_gqa=True, scale=self.scale
+            )
             # this gives us the result from probs @ V
             # (batch, num_heads, seq_len, head_dim)
         else:
             # manual GQA implementation
-            # give every query head its KV head: if we do matmul with the previous shapes, 
+            # give every query head its KV head: if we do matmul with the previous shapes,
             # q has 8 heads, kv has 2, there's a mismatch
             # takes the first dim (heads) and turns it into [h0, h0, h0, h0, h1, h1, h1, h1]
             k = k.repeat_interleave(self.q_groupsize, dim=1)
@@ -140,19 +146,25 @@ class GQAttention(nn.Module):
             attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
 
             # causal mask
-            if causal:                
+            if causal:
                 # keep what's above the diagonal, for shape seq_len x seq_len
-                mask = torch.triu(torch.ones(S, S, dtype=torch.bool, device=x.device), diagonal=1)
+                mask = torch.triu(
+                    torch.ones(S, S, dtype=torch.bool, device=x.device), diagonal=1
+                )
                 # fill the mask area with -infinity for softmax to turn to 0
                 attn_scores = attn_scores.masked_fill(mask, float("-inf"))
 
             # softmax
-            probs = attn_scores.softmax(dim=-1) # last dimension to get probabilities for the keys
-            
+            probs = attn_scores.softmax(
+                dim=-1
+            )  # last dimension to get probabilities for the keys
+
             # output
-            out = probs @ v # multiply each query row's probabilities against V, (B, heads, S, head_dim)
-            
-        out = out.transpose(1, 2) # flip heads and seq_len, (B, S, heads, head_dim)
+            out = (
+                probs @ v
+            )  # multiply each query row's probabilities against V, (B, heads, S, head_dim)
+
+        out = out.transpose(1, 2)  # flip heads and seq_len, (B, S, heads, head_dim)
         out = out.reshape(B, S, self.n_heads * self.head_dim)
 
         output = self.wo(out)

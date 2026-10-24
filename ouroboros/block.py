@@ -15,6 +15,7 @@ from .feedforward import FeedForward
 
 __all__ = ["TransformerBlock"]
 
+
 class TransformerBlock(nn.Module):
     """Pre-norm block: GQA attention then an FFN, each with a residual::
 
@@ -34,7 +35,7 @@ class TransformerBlock(nn.Module):
             use_moe: Use the MoE FFN instead of a dense one.
         """
         super().__init__()
-        
+
         self.attn = GQAttention(cfg=cfg)
         self.attn_norm = RMSNorm(dim=cfg.dim, eps=cfg.norm_eps)
         self.attn_dropout = nn.Dropout(cfg.dropout)
@@ -45,7 +46,7 @@ class TransformerBlock(nn.Module):
         else:
             self.hidden_dim = (8 * cfg.dim) // 3
             self.ffn = FeedForward(dim=cfg.dim, hidden_dim=self.hidden_dim)
-        
+
         self.ffn_norm = RMSNorm(dim=cfg.dim, eps=cfg.norm_eps)
         self.ffn_dropout = nn.Dropout(cfg.dropout)
 
@@ -66,15 +67,21 @@ class TransformerBlock(nn.Module):
         Returns:
             ``(B, T, dim)``.
         """
-        
+
         # attention
         x_ = self.attn_norm(x)
-        x_ = self.attn(x_, rope_angles=rope_angles, causal=causal, kv_cache=kv_cache, cache_key=cache_key)
+        x_ = self.attn(
+            x_,
+            rope_angles=rope_angles,
+            causal=causal,
+            kv_cache=kv_cache,
+            cache_key=cache_key,
+        )
         x = x + self.attn_dropout(x_)
 
         # ffn
         x_ = self.ffn_norm(x)
         x_ = self.ffn(x_)
         x = x + self.ffn_dropout(x_)
-        
+
         return x

@@ -1,7 +1,7 @@
-"""Integration-test stubs for the full :class:`~ouroboros.model.Ouroboros` model.
+"""Integration tests for the full :class:`~ouroboros.model.Ouroboros` model.
 
 These exercise the assembled model end to end: embedding, Prelude, recurrent
-block, Coda, and the tied LM head (``ROADMAP.md`` section 9). Each test states its
+block, Coda, and the tied LM head (``docs/ROADMAP.md`` section 9). Each test states its
 assertion in its docstring.
 """
 

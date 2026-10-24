@@ -1,4 +1,4 @@
-# Ouroboros (work in progress)
+# Ouroboros
 
 Started: 2026-06-04
 
@@ -116,6 +116,7 @@ Training and the loop-count sweep:
 ```bash
 python training/train.py --tiny --max-steps 50          # smoke run
 python training/train.py --wandb-project ouroboros       # main run
+python training/train.py --resume checkpoints/latest.pt  # continue after a disconnect
 python training/loop_sweep.py --ckpt checkpoints/final.pt
 python training/kv_speedup.py --ckpt checkpoints/final.pt
 ```

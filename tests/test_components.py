@@ -1,8 +1,7 @@
 """Unit tests for the individual Ouroboros components.
 
 Each test names the property it checks and states the assertion in its
-docstring. Sections 2 to 8 have real bodies and fail until the component is
-implemented. Section numbers follow ``ROADMAP.md``:
+docstring. Section numbers follow ``docs/ROADMAP.md``:
 
 * Section 2: ``RMSNorm``, ``FeedForward`` (SwiGLU).
 * Section 3: RoPE.
@@ -248,7 +247,9 @@ def test_apply_rope_dot_product_depends_only_on_relative_position() -> None:
     k = torch.randn(1, 1, 1, 16)
 
     def logit(m: int, n: int) -> torch.Tensor:
-        return (apply_rope(q, angles[m : m + 1]) * apply_rope(k, angles[n : n + 1])).sum()
+        return (
+            apply_rope(q, angles[m : m + 1]) * apply_rope(k, angles[n : n + 1])
+        ).sum()
 
     torch.testing.assert_close(logit(5, 2), logit(13, 10), atol=1e-4, rtol=1e-4)
     assert not torch.allclose(logit(5, 2), logit(5, 1))

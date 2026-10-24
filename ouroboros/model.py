@@ -1,4 +1,6 @@
-"""The full Ouroboros model and its generation loop::
+"""The full Ouroboros model and its generation loop.
+
+Pipeline::
 
     embed -> Prelude (once) -> Recurrent (n_loops) -> Coda (once) -> norm -> head
 """
