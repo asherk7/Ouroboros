@@ -2,17 +2,13 @@
 
 Started: 2026-06-04
 
-**A recurrent-depth (looped) transformer written from scratch in PyTorch, as a learning project: a Prelude / Recurrent / Coda design with LTI-stable looping, GQA attention with a KV cache, and a fine-grained MoE.**
+**A looped transformer written from scratch in PyTorch, as a learning project.**
 
-Instead of stacking more unique layers, Ouroboros loops one weight-shared
-transformer block a variable number of times, so the same parameters do more
-computation the longer they run. It is trained with a random loop count each
-step, so the number of loops can be turned up or down at test time.
-
-The goal is to understand how looped models work and how they are trained, and
-to learn the standard parts of a modern LLM along the way. Reading comes first;
-the code makes the reading concrete. The papers behind it are in the
-[roadmap](ROADMAP.md), section by section.
+Instead of stacking unique layers, Ouroboros runs one shared block several
+times, and the number of loops can be changed at test time. Along the way it
+implements the standard parts of a modern LLM: GQA, a KV cache, RoPE, and a
+mixture of experts. The papers behind each part are in the
+[roadmap](docs/ROADMAP.md).
 
 ---
 
@@ -82,13 +78,13 @@ h_{t+1} = A · h_t + B · e + R(h_t, e),   with   ρ(A) < 1.
 during training.
 
 The component reference (math, shapes, gotchas, and the reasoning behind each
-design choice) is in [`ARCHITECTURE.md`](ARCHITECTURE.md).
+design choice) is in [`ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ---
 
 ## Installation
 
-Requires Python 3.10+ and PyTorch 2.1+.
+Requires Python 3.10+ and PyTorch 2.3+.
 
 ```bash
 git clone <repo-url> Ouroboros
@@ -126,12 +122,49 @@ python training/kv_speedup.py --ckpt checkpoints/final.pt
 
 ---
 
+## Results
+
+Trained for 5000 steps (about 164M tokens of TinyStories, about 3 hours on a
+Colab T4). Final validation perplexity: **4.74**. Logs and plots are in
+[`train_results/`](train_results/).
+
+**1. Test-time loop count.** One model, evaluated at different loop counts:
+
+| loops | 1 | 2 | 4 | 8 | 16 | 32 | 64 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| val perplexity | 5.29 | 4.87 | 4.79 | **4.78** | 4.78 | 4.78 | 4.79 |
+
+More loops help up to the training mean of 8, then the curve flattens and stays
+stable even at 64 loops. Over training, `ρ(A)` fell from 0.37 to 0.24: the model
+chose to carry less of the previous loop's state.
+
+![Perplexity vs loop count](train_results/results/loop_sweep.png)
+
+**2. Stability.** Two 1000-step runs at a high learning rate (3e-3), LTI vs a
+naive injection. Neither diverged, and the naive run was slightly ahead
+(validation perplexity 8.30 vs 9.20 at step 500).\*
+
+![LTI vs naive loss curves](train_results/results/stability_lr3e-3.png)
+
+\* The naive arm already passes the state through an RMSNorm every loop, which
+keeps it bounded, so it isn't a truly unstable baseline. LTI also starts with
+weaker input re-injection (`B = 0.1`), and the scale is small. LTI may only
+show an advantage without the norm or at larger scale.
+
+**3. KV-cache speedup.** **1.46x** faster decoding with the cache (256 new
+tokens, 8 loops, batch 1). The gain is small because at batch 1 a model this
+size is limited by per-step overhead (kernel launches, syncs in the MoE), not
+by the compute the cache saves. Batching requests or removing the overhead
+(CUDA graphs, fused kernels) is where caching pays off.
+
+---
+
 ## Documentation
 
 | Doc | Contents |
 | --- | --- |
-| [`ROADMAP.md`](ROADMAP.md) | The learning plan: what to read and what to build, section by section, plus the training setup and the three metrics. |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | The architecture: layers, mechanisms, and why each was chosen. |
+| [`ROADMAP.md`](docs/ROADMAP.md) | The learning plan: what to read and what to build, section by section, plus the training setup and the three metrics. |
+| [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) | The architecture: layers, mechanisms, and why each was chosen. |
 
 ---
 

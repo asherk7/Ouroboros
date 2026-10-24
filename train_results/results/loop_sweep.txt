@@ -1,0 +1,10 @@
+loops   1 | val_ppl 5.288
+loops   2 | val_ppl 4.873
+loops   4 | val_ppl 4.786
+loops   8 | val_ppl 4.780
+loops  16 | val_ppl 4.781
+loops  32 | val_ppl 4.784
+loops  64 | val_ppl 4.787
+
+1 loop: 5.288 | best: 4.780 at 8 loops | 64 loops: 4.787
+plot -> /content/drive/MyDrive/ouroboros/results/loop_sweep.png

@@ -21,7 +21,7 @@ import time
 
 import torch
 
-from training.train import load_model
+from train import load_model
 
 
 def sync(device: str) -> None:

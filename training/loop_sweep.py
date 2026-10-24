@@ -25,7 +25,7 @@ matplotlib.use("Agg")  # no display on Colab / CI; just write the file
 import matplotlib.pyplot as plt  # noqa: E402
 import torch  # noqa: E402
 
-from training.train import TrainConfig, build_dataloader, evaluate, load_model  # noqa: E402
+from train import TrainConfig, build_dataloader, evaluate, load_model  # noqa: E402
 
 DEFAULT_LOOPS: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64)
 
